@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/rasonyang/cascade-realtime-gateway/internal/audio"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/provider"
@@ -26,6 +29,8 @@ type pipeline struct {
 	llm provider.LLM
 	tts provider.TTS
 	out chan<- Event
+
+	firstAudioMs int64 // per-sentence TTFA, filled by drain (TTS goroutine only)
 }
 
 // textChunkQueue and sentenceQueue bound the data-plane channels between
@@ -154,8 +159,10 @@ func (p *pipeline) ttsPerSentence(sentences <-chan sentence) {
 }
 
 // synthesizeOne runs a full request for one sentence and returns the number
-// of audio bytes forwarded.
+// of audio bytes forwarded. One Debug log per sentence records the TTS
+// time-to-first-audio and total time; nothing is logged per frame.
 func (p *pipeline) synthesizeOne(text string) (int, bool) {
+	started := time.Now()
 	stream, err := p.tts.Synthesize(p.ctx, p.ttsCfg)
 	if err != nil {
 		p.fail("tts", err)
@@ -170,7 +177,10 @@ func (p *pipeline) synthesizeOne(text string) (int, bool) {
 		p.fail("tts", err)
 		return 0, false
 	}
-	return p.drain(stream)
+	n, ok := p.drain(stream)
+	slog.Debug("tts sentence", "chars", utf8.RuneCountInString(text), "audio_ms", audio.BytesToMs(n),
+		"first_audio_ms", p.firstAudioMs, "total_ms", time.Since(started).Milliseconds(), "ok", ok)
+	return n, ok
 }
 
 func (p *pipeline) ttsIncremental(sentences <-chan sentence) {
@@ -207,9 +217,12 @@ func (p *pipeline) ttsIncremental(sentences <-chan sentence) {
 	p.send(pipeTTSDone{Gen: p.gen})
 }
 
-// drain forwards audio chunks until EOF and returns the byte count.
+// drain forwards audio chunks until EOF and returns the byte count. It
+// records the time to the first audio chunk in firstAudioMs.
 func (p *pipeline) drain(stream provider.TTSStream) (int, bool) {
 	total := 0
+	started := time.Now()
+	p.firstAudioMs = -1
 	for {
 		chunk, err := stream.ReadAudio()
 		if errors.Is(err, io.EOF) {
@@ -228,6 +241,9 @@ func (p *pipeline) drain(stream provider.TTSStream) (int, bool) {
 			continue
 		}
 		pcm := chunk.PCM[:audio.AlignDown(len(chunk.PCM))]
+		if p.firstAudioMs < 0 {
+			p.firstAudioMs = time.Since(started).Milliseconds()
+		}
 		if !p.send(EvOutputAudioDelta{Resp: p.resp, Item: p.item, Gen: p.gen, PCM: pcm}) {
 			return total, false
 		}

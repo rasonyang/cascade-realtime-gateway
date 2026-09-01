@@ -17,9 +17,14 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/rasonyang/cascade-realtime-gateway/internal/audio"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/config"
+	"github.com/rasonyang/cascade-realtime-gateway/internal/observability"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/provider"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/provider/openai"
 
@@ -154,7 +159,11 @@ func TestE2EVoiceTurnAndInterrupt(t *testing.T) {
 	}
 	t.Logf("llm model: %s (override with CASCADE_E2E_LLM_MODEL)", llmModel)
 	cfg.Providers.LLM = config.Provider{Type: "openai", APIKey: oaKey, Options: json.RawMessage(fmt.Sprintf(`{"model":%q}`, llmModel))}
-	cfg.Providers.TTS = config.Provider{Type: "openai", APIKey: oaKey, Options: json.RawMessage(`{"model":"tts-1"}`)}
+	ttsModel := os.Getenv("CASCADE_E2E_TTS_MODEL")
+	if ttsModel == "" {
+		ttsModel = "tts-1"
+	}
+	cfg.Providers.TTS = config.Provider{Type: "openai", APIKey: oaKey, Options: json.RawMessage(fmt.Sprintf(`{"model":%q}`, ttsModel))}
 	cfg.SessionDefaults.Instructions = "You are a concise voice assistant. Answer in one short sentence."
 	cfg.Limits.ASRFinalTimeout = config.Duration(5 * time.Second)
 	cfg.SessionDefaults.Audio.Input.TurnDetection.ApplyDefaults() // DefaultConfig leaves tuning fields to Load
@@ -169,7 +178,11 @@ func TestE2EVoiceTurnAndInterrupt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := New(Options{Config: cfg, Providers: providers, Logger: slog.New(capture)})
+	// In-memory telemetry so the run can be profiled from the Phase 5 metrics.
+	spanExp := tracetest.NewInMemoryExporter()
+	reader := sdkmetric.NewManualReader()
+	tel := observability.New(sdktrace.NewTracerProvider(sdktrace.WithSyncer(spanExp)), sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	srv := New(Options{Config: cfg, Providers: providers, Logger: slog.New(capture), Telemetry: tel})
 	f := &fixture{t: t, srv: srv, http: nil}
 	f.http = newHTTPServer(srv)
 	defer f.http.Close()
@@ -254,6 +267,62 @@ turn1done:
 	if r, ok := capture.find("transcript final", "", time.Time{}); ok {
 		t.Logf("TURN 1  session commit_to_final_ms=%s", r.attrs["commit_to_final_ms"])
 	}
+	profileTurn(t, reader, spanExp, committedAt)
+	capture.dump(t, "deepgram finalize satisfied")
+	capture.dump(t, "deepgram finalize timed out")
+
+	// ---- Profile turn: a three-sentence answer, streamed end to end ----------
+	{
+		ask := synthesize(t, oaKey, "Describe the ocean in exactly three short sentences.")
+		sendAudio(silence(300))
+		sendAudio(ask)
+		sendAudio(silence(1500))
+		var commit, firstText, firstAudio, lastAudio, doneAt time.Time
+		textDeltas, audioDeltas := 0, 0
+		var textAt []time.Duration
+		for {
+			fr, err := c.read()
+			if err != nil {
+				t.Fatal(err)
+			}
+			typ := fr["type"].(string)
+			switch typ {
+			case "error":
+				t.Fatalf("profile turn error: %v", fr["error"])
+			case "input_audio_buffer.committed":
+				commit = time.Now()
+			case "response.output_audio_transcript.delta":
+				textDeltas++
+				if firstText.IsZero() {
+					firstText = time.Now()
+				}
+				textAt = append(textAt, time.Since(commit))
+			case "response.output_audio.delta":
+				audioDeltas++
+				if firstAudio.IsZero() {
+					firstAudio = time.Now()
+				}
+				lastAudio = time.Now()
+			case "response.output_audio_transcript.done":
+				t.Logf("PROFILE2 reply=%q", fr["transcript"])
+			case "response.done":
+				doneAt = time.Now()
+				r := fr["response"].(map[string]any)
+				if r["status"] == "cancelled" {
+					t.Logf("PROFILE2 intermediate cancelled; continuing")
+					continue
+				}
+				goto profiled
+			}
+		}
+	profiled:
+		off := func(at time.Time) time.Duration { return at.Sub(commit).Round(time.Millisecond) }
+		t.Logf("PROFILE2 commit→first text %v | first text→first audio %v | first audio→last audio %v | last audio→done %v | text deltas %d (last at %v) | audio deltas %d",
+			off(firstText), firstAudio.Sub(firstText).Round(time.Millisecond), lastAudio.Sub(firstAudio).Round(time.Millisecond), doneAt.Sub(lastAudio).Round(time.Millisecond),
+			textDeltas, textAt[len(textAt)-1].Round(time.Millisecond), audioDeltas)
+		capture.dump(t, "tts sentence")
+		time.Sleep(300 * time.Millisecond)
+	}
 
 	// ---- Turns 2 and 3: interrupt mid-response --------------------------------
 	// Turn 2 cancels at the first audio delta (TTS in flight, the LLM may
@@ -306,4 +375,70 @@ turn1done:
 		types = append(types, s.typ)
 	}
 	t.Logf("TURN 1 events: %s", strings.Join(types, " → "))
+}
+
+// profileTurn prints a latency breakdown of the first response from the
+// Phase 5 instruments: histogram values plus span start offsets.
+func profileTurn(t *testing.T, reader *sdkmetric.ManualReader, spans *tracetest.InMemoryExporter, committedAt time.Time) {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	hist := map[string]float64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if h, ok := m.Data.(metricdata.Histogram[float64]); ok {
+				for _, dp := range h.DataPoints {
+					if dp.Count > 0 {
+						hist[m.Name] = dp.Sum / float64(dp.Count)
+					}
+				}
+			}
+		}
+	}
+	var resp, llm, tts *tracetest.SpanStub
+	for i := range spans.GetSpans() {
+		sp := spans.GetSpans()[i]
+		switch sp.Name {
+		case "response":
+			if resp == nil {
+				resp = &sp
+			}
+		case "llm":
+			if llm == nil {
+				llm = &sp
+			}
+		case "tts":
+			if tts == nil {
+				tts = &sp
+			}
+		}
+	}
+	if resp == nil || llm == nil || tts == nil {
+		t.Logf("PROFILE  spans incomplete (response=%v llm=%v tts=%v)", resp != nil, llm != nil, tts != nil)
+		return
+	}
+	off := func(at time.Time) string { return at.Sub(committedAt).Round(time.Millisecond).String() }
+	t.Logf("PROFILE  t=0 commit | response.created %s | ASR final %s (asr.commit_to_final) | pipeline start %s | first text %s (llm.ttft %.0fms) | tts start %s | first audio %s (tts.first_audio %.0fms) | e2e %.0fms",
+		off(resp.StartTime), off(committedAt.Add(time.Duration(hist["cascade.asr.commit_to_final_ms"]*float64(time.Millisecond)))),
+		off(llm.StartTime), off(llm.StartTime.Add(time.Duration(hist["cascade.llm.ttft_ms"]*float64(time.Millisecond)))), hist["cascade.llm.ttft_ms"],
+		off(tts.StartTime), off(tts.StartTime.Add(time.Duration(hist["cascade.tts.first_audio_ms"]*float64(time.Millisecond)))), hist["cascade.tts.first_audio_ms"], hist["cascade.e2e_ms"])
+	t.Logf("PROFILE  breakdown: awaiting ASR final %v | LLM TTFT %v | first sentence complete after %v more | TTS first audio %v | llm span %v | tts span %v",
+		llm.StartTime.Sub(resp.StartTime).Round(time.Millisecond),
+		time.Duration(hist["cascade.llm.ttft_ms"]*float64(time.Millisecond)).Round(time.Millisecond),
+		(tts.StartTime.Sub(llm.StartTime) - time.Duration(hist["cascade.llm.ttft_ms"]*float64(time.Millisecond))).Round(time.Millisecond),
+		time.Duration(hist["cascade.tts.first_audio_ms"]*float64(time.Millisecond)).Round(time.Millisecond),
+		llm.EndTime.Sub(llm.StartTime).Round(time.Millisecond), tts.EndTime.Sub(tts.StartTime).Round(time.Millisecond))
+	t.Logf("PROFILE  asr: speech stop→final %.0fms, first partial after speech start %.0fms", hist["cascade.asr.final_transcript_ms"], hist["cascade.asr.first_transcript_ms"])
+}
+
+func (c *logCapture) dump(t *testing.T, msg string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, r := range c.recs {
+		if r.msg == msg {
+			t.Logf("PROFILE  %s %v", msg, r.attrs)
+		}
+	}
 }

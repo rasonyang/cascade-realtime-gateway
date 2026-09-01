@@ -185,8 +185,9 @@ type stream struct {
 	events chan provider.ASREvent
 	done   chan struct{}
 
-	closeSent chan struct{} // closed by the writer once CloseStream is on the wire
-	openedAt  time.Time
+	closeSent  chan struct{} // closed by the writer once CloseStream is on the wire
+	openedAt   time.Time
+	finalizeAt time.Time // when the last Finalize was requested (latency log)
 
 	mu            sync.Mutex
 	finalizeTimer *time.Timer
@@ -235,6 +236,7 @@ func (s *stream) Finalize() error {
 		s.finalizeTimer.Stop()
 	}
 	s.finalizeTimer = time.AfterFunc(s.opts.FinalizeTimeout.Std(), s.finalizeTimedOut)
+	s.finalizeAt = time.Now()
 	s.mu.Unlock()
 	select {
 	case s.ctl <- `{"type":"Finalize"}`:
@@ -249,17 +251,24 @@ func (s *stream) Finalize() error {
 func (s *stream) finalizeTimedOut() {
 	s.mu.Lock()
 	s.finalizeTimer = nil
+	waited := time.Since(s.finalizeAt)
 	s.mu.Unlock()
+	slog.Debug("deepgram finalize timed out", "provider", Name, "waited_ms", waited.Milliseconds())
 	s.emit(provider.ASREvent{Kind: provider.ASREndOfTurn})
 }
 
 func (s *stream) finalizeSatisfied() {
 	s.mu.Lock()
-	if s.finalizeTimer != nil {
+	pending := s.finalizeTimer != nil
+	if pending {
 		s.finalizeTimer.Stop()
 		s.finalizeTimer = nil
 	}
+	waited := time.Since(s.finalizeAt)
 	s.mu.Unlock()
+	if pending {
+		slog.Debug("deepgram finalize satisfied", "provider", Name, "round_trip_ms", waited.Milliseconds())
+	}
 }
 
 // Events implements provider.ASRStream.
