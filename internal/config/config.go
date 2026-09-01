@@ -134,6 +134,7 @@ type Limits struct {
 	ASRFinalTimeout       Duration `json:"asr_final_timeout"`
 	OutputEventQueue      int      `json:"output_event_queue"`
 	ClientWriteTimeout    Duration `json:"client_write_timeout"`
+	ClientMaxMessageBytes int      `json:"client_max_message_bytes"`
 }
 
 // Observability configures logging and tracing export.
@@ -186,6 +187,7 @@ func DefaultConfig() *Config {
 			ASRFinalTimeout:       Duration(2 * time.Second),
 			OutputEventQueue:      256,
 			ClientWriteTimeout:    Duration(10 * time.Second),
+			ClientMaxMessageBytes: 16 << 20,
 		},
 		Observability: Observability{
 			LogLevel: "info",

@@ -29,7 +29,8 @@
     "input_audio_buffer_max_ms": 60000,
     "asr_final_timeout": "2s",
     "output_event_queue": 256,
-    "client_write_timeout": "10s"
+    "client_write_timeout": "10s",
+    "client_max_message_bytes": 16777216
   },
   "observability": { "log_level": "info", "otel_endpoint": "" }
 }

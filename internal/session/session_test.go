@@ -74,9 +74,10 @@ func TestNormalTurnServerVAD(t *testing.T) {
 		t.Fatalf("audio ms = %d", done.Output[0].AudioMs)
 	}
 	_, adIdx := first[EvOutputAudioDone](events)
+	_, tdIdx := first[EvOutputAudioTranscriptDone](events)
 	_, oiIdx := first[EvOutputItemDone](events)
 	_, rdIdx := first[EvResponseDone](events)
-	if !(adIdx < oiIdx && oiIdx < rdIdx) {
+	if !(adIdx < tdIdx && tdIdx < oiIdx && oiIdx < rdIdx) {
 		t.Fatalf("terminal order wrong: %s", describe(events))
 	}
 	// Per-sentence TTS: two streams, one per sentence.
@@ -275,6 +276,18 @@ func TestTruncateTrimsContextForNextTurn(t *testing.T) {
 		t.Fatal("truncated text leaked into context")
 	}
 
+	// Beyond the generated audio: error, never a clamp.
+	h.post(CmdTruncateItem{Meta: Meta{Tag: "far"}, ID: out.Ref, AudioEndMs: 5000})
+	ev0, _ := h.waitFor("out of range", func(e Event) bool { er, ok := e.(EvError); return ok && er.Tag == "far" })
+	if e := ev0.(EvError); e.Code != ErrCodeTruncateOutOfRange || e.Param != "audio_end_ms" {
+		t.Fatalf("error = %+v", e)
+	}
+	// Exactly the total is allowed and trims nothing further.
+	h.post(CmdTruncateItem{ID: out.Ref, AudioEndMs: 120})
+	h.waitFor("truncate at total", func(e Event) bool {
+		return count[EvItemTruncated](h.all()) == 2
+	})
+
 	// Errors: unknown item, non-assistant item.
 	h.post(CmdTruncateItem{Meta: Meta{Tag: "bad"}, ID: 999, AudioEndMs: 1})
 	ev, _ := h.waitFor("not found", func(e Event) bool { er, ok := e.(EvError); return ok && er.Tag == "bad" })
@@ -409,7 +422,7 @@ func TestIncompleteAndFailedOutcomes(t *testing.T) {
 	}
 	er, ei := first[EvError](h2.all())
 	_, di := first[EvResponseDone](h2.all())
-	if ei < 0 || ei > di || er.Code != ErrCodeResponseFailed || er.Tag != "r" || er.Fatal {
+	if ei < 0 || ei > di || er.Code != ErrCodeProviderError || er.Tag != "r" || er.Fatal {
 		t.Fatalf("error = %+v (idx %d, done %d)", er, ei, di)
 	}
 
@@ -473,16 +486,45 @@ func TestSessionUpdate(t *testing.T) {
 	bad := 3.0
 	h.post(CmdUpdateSession{Meta: Meta{Tag: "u2"}, Patch: SessionPatch{Speed: &bad}})
 	ev, _ = h.waitFor("invalid update", func(e Event) bool { er, ok := e.(EvError); return ok && er.Tag == "u2" })
-	if e := ev.(EvError); e.Code != ErrCodeInvalidSession || !strings.Contains(e.Message, "session.audio.output.speed") {
+	if e := ev.(EvError); e.Code != ErrCodeInvalidSession || e.Param != "session.audio.output.speed" {
 		t.Fatalf("error = %+v", e)
 	}
+	// Voice may change before any audio was produced.
+	v1 := "coral"
+	h.post(CmdUpdateSession{Patch: SessionPatch{Voice: &v1}})
+	h.waitFor("voice updated", func(e Event) bool {
+		u, ok := e.(EvSessionUpdated)
+		return ok && u.Config.Audio.Output.Voice == "coral"
+	})
 	// Instructions apply to the next response.
 	h.post(CmdCommitAudio{})
 	h.post(CmdCreateResponse{})
+	created, _ := h.waitFor("created", func(e Event) bool { _, ok := e.(EvResponseCreated); return ok })
+	if c := created.(EvResponseCreated); c.Voice != "coral" || len(c.OutputModalities) != 1 || c.OutputModalities[0] != "audio" || !c.MaxOutputTokens.Inf {
+		t.Fatalf("created = %+v", c)
+	}
 	h.waitResponseDone(0)
 	if reqs := h.llm.Requests(); reqs[0].Instructions != instr {
 		t.Fatalf("instructions = %q", reqs[0].Instructions)
 	}
+	if h.tts.Streams()[0].Text() == "" {
+		t.Fatal("tts stream missing")
+	}
+	// After audio was produced the voice is locked, for session and response.
+	v2 := "verse"
+	h.post(CmdUpdateSession{Meta: Meta{Tag: "v2"}, Patch: SessionPatch{Voice: &v2}})
+	ev, _ = h.waitFor("voice locked", func(e Event) bool { er, ok := e.(EvError); return ok && er.Tag == "v2" })
+	if e := ev.(EvError); e.Code != ErrCodeVoiceLocked || e.Param != "session.audio.output.voice" {
+		t.Fatalf("error = %+v", e)
+	}
+	h.post(CmdCreateResponse{Meta: Meta{Tag: "v3"}, Overrides: ResponseOverrides{Voice: &v2}})
+	ev, _ = h.waitFor("response voice locked", func(e Event) bool { er, ok := e.(EvError); return ok && er.Tag == "v3" })
+	if e := ev.(EvError); e.Code != ErrCodeVoiceLocked || e.Param != "response.audio.output.voice" {
+		t.Fatalf("error = %+v", e)
+	}
+	same := "coral"
+	h.post(CmdUpdateSession{Patch: SessionPatch{Voice: &same}}) // same voice: allowed
+	h.waitFor("same voice ok", func(e Event) bool { return count[EvSessionUpdated](h.all()) == 3 })
 	// Switching to semantic_vad rebuilds the detector and echoes eagerness.
 	high := "high"
 	h.post(CmdUpdateSession{Patch: SessionPatch{TurnDetection: Nullable[config.TurnDetection]{Set: true, Value: &config.TurnDetection{Type: config.TurnDetectionSemanticVAD, Eagerness: &high, CreateResponse: true, InterruptResponse: true}}}})
@@ -590,14 +632,21 @@ func TestCancelResponseCommand(t *testing.T) {
 	sc := defaultScripts()
 	sc.llm.Block, sc.llm.BlockAfter = true, 2
 	h := newHarness(t, sc, manual)
-	h.post(CmdCancelResponse{}) // nothing active: no-op
+	h.post(CmdCancelResponse{Meta: Meta{Tag: "c0"}}) // nothing active: error
+	ev, _ := h.waitFor("not active", func(e Event) bool { er, ok := e.(EvError); return ok && er.Tag == "c0" })
+	if e := ev.(EvError); e.Code != ErrCodeResponseCancelNotActive || e.Param != "" {
+		t.Fatalf("error = %+v", e)
+	}
 	h.post(CmdCreateItem{Item: ItemSpec{Role: RoleUser, Text: "hi"}})
 	h.post(CmdCreateResponse{})
 	h.waitFor("delta", func(e Event) bool { _, ok := e.(EvOutputAudioTranscriptDelta); return ok })
-	h.post(CmdCancelResponse{Resp: 99}) // wrong ref: no-op
-	time.Sleep(20 * time.Millisecond)
+	h.post(CmdCancelResponse{Meta: Meta{Tag: "c1"}, Resp: 99}) // foreign ref: error, response untouched
+	ev, _ = h.waitFor("foreign ref", func(e Event) bool { er, ok := e.(EvError); return ok && er.Tag == "c1" })
+	if e := ev.(EvError); e.Code != ErrCodeResponseCancelNotActive || e.Param != "response_id" {
+		t.Fatalf("error = %+v", e)
+	}
 	if count[EvResponseDone](h.all()) != 0 {
-		t.Fatal("cancel with a foreign ref must be ignored")
+		t.Fatal("cancel with a foreign ref must not cancel")
 	}
 	h.post(CmdCancelResponse{})
 	if d := h.waitResponseDone(0); d.Status != ResponseCancelled || d.Reason != ReasonClientCancelled {

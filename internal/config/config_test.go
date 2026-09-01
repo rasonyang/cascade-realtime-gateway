@@ -77,7 +77,7 @@ func TestLoadMinimalAppliesDefaults(t *testing.T) {
 	if cfg.Listen != ":8080" {
 		t.Fatalf("listen default = %q", cfg.Listen)
 	}
-	if cfg.Limits.SessionTimeout.Std() != 30*time.Minute || cfg.Limits.OutputEventQueue != 256 {
+	if cfg.Limits.SessionTimeout.Std() != 30*time.Minute || cfg.Limits.OutputEventQueue != 256 || cfg.Limits.ClientMaxMessageBytes != 16<<20 {
 		t.Fatalf("limits defaults not applied: %+v", cfg.Limits)
 	}
 	td := cfg.SessionDefaults.Audio.Input.TurnDetection
@@ -323,6 +323,7 @@ func TestTopLevelValidation(t *testing.T) {
 		{"api key empty", strings.Replace(minimal, `"{env.REALTIME_API_KEY}"`, `""`, 1), "auth.api_key", "empty"},
 		{"asr type empty", strings.Replace(minimal, `"asr": { "type": "mock" }`, `"asr": {}`, 1), "providers.asr.type", "empty"},
 		{"limit zero", minimal[:len(minimal)-1] + `, "limits": { "input_audio_queue_frames": 0 } }`, "limits.input_audio_queue_frames", "> 0"},
+		{"max message zero", minimal[:len(minimal)-1] + `, "limits": { "client_max_message_bytes": 0 } }`, "limits.client_max_message_bytes", "> 0"},
 		{"timeout zero", minimal[:len(minimal)-1] + `, "limits": { "client_write_timeout": "0s" } }`, "limits.client_write_timeout", "> 0"},
 		{"log level", minimal[:len(minimal)-1] + `, "observability": { "log_level": "trace" } }`, "observability.log_level", "must be one of"},
 	}

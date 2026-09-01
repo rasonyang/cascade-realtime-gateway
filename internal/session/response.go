@@ -25,6 +25,8 @@ type response struct {
 	textOnly     bool
 	instructions string
 	maxTokens    int // 0 = unlimited
+	voice        string
+	failCode     string
 	finish       provider.FinishReason
 	usage        Usage
 	tag          string

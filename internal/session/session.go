@@ -83,6 +83,8 @@ type Session struct {
 	activeGen Generation
 	nextResp  ResponseRef
 
+	audioEmitted bool // first output audio delta sent: voice is locked (GA)
+
 	speechItem    ItemRef // pre-allocated at speech start, reused by commit
 	pendingItem   *item   // committed audio item awaiting its transcript
 	transcriptAcc string  // Finals accumulated since the last commit
@@ -105,6 +107,9 @@ func New(opts Options) *Session {
 		log = slog.Default()
 	}
 	cfg := opts.Session.Clone()
+	if td := cfg.Audio.Input.TurnDetection; td != nil {
+		td.ApplyDefaults() // DefaultConfig leaves mode-specific fields nil
+	}
 	s := &Session{
 		id:         opts.ID,
 		cfg:        cfg,
@@ -199,6 +204,15 @@ func (s *Session) Close(reason CloseReason) { s.cancel(closeError{reason}) }
 
 // ID returns the session identifier.
 func (s *Session) ID() string { return s.id }
+
+// fieldOf extracts the dotted field path from a config validation error.
+func fieldOf(err error) string {
+	var fe *config.FieldError
+	if errors.As(err, &fe) {
+		return fe.Field
+	}
+	return ""
+}
 
 // closeError carries the CloseReason through context cancellation causes.
 type closeError struct{ reason CloseReason }
@@ -323,6 +337,10 @@ func (s *Session) emitError(tag, code, msg string) {
 	s.emit(EvError{Tag: tag, Code: code, Message: msg})
 }
 
+func (s *Session) emitParamError(tag, code, param, msg string) {
+	s.emit(EvError{Tag: tag, Code: code, Message: msg, Param: param})
+}
+
 // fatal emits a fatal error and closes the session.
 func (s *Session) fatal(code, msg string, reason CloseReason) {
 	s.emit(EvError{Code: code, Message: msg, Fatal: true})
@@ -375,9 +393,9 @@ func (s *Session) asrConfig() provider.ASRConfig {
 	return cfg
 }
 
-func (s *Session) ttsConfig() provider.TTSConfig {
+func (s *Session) ttsConfig(voice string) provider.TTSConfig {
 	return provider.TTSConfig{
-		Voice:      s.cfg.Audio.Output.Voice,
+		Voice:      voice,
 		Speed:      s.cfg.Audio.Output.Speed,
 		SampleRate: audio.SampleRate,
 	}
@@ -479,8 +497,13 @@ func (s *Session) handleCommand(cmd Command) {
 			s.createResponse(c.Overrides, tag)
 		}
 	case CmdCancelResponse:
-		if s.active == nil || (c.Resp != 0 && c.Resp != s.active.ref) {
-			return // PROTOCOL-VERIFY: whether GA errors here is decided in Phase 2
+		if s.active == nil {
+			s.emitError(tag, ErrCodeResponseCancelNotActive, "no response is in progress")
+			return
+		}
+		if c.Resp != 0 && c.Resp != s.active.ref {
+			s.emitParamError(tag, ErrCodeResponseCancelNotActive, "response_id", "response is not in progress")
+			return
 		}
 		s.interrupt(ReasonClientCancelled)
 	case CmdClose:
@@ -497,6 +520,10 @@ func (s *Session) updateSession(p SessionPatch, tag string) {
 		next.OutputModalities = append([]string(nil), p.OutputModalities...)
 	}
 	if p.Voice != nil {
+		if *p.Voice != s.cfg.Audio.Output.Voice && s.audioEmitted {
+			s.emitParamError(tag, ErrCodeVoiceLocked, "session.audio.output.voice", "voice cannot be changed after the session has produced audio")
+			return
+		}
 		next.Audio.Output.Voice = *p.Voice
 	}
 	if p.Speed != nil {
@@ -515,7 +542,7 @@ func (s *Session) updateSession(p SessionPatch, tag string) {
 		}
 	}
 	if err := next.Validate("session"); err != nil {
-		s.emitError(tag, ErrCodeInvalidSession, err.Error())
+		s.emitParamError(tag, ErrCodeInvalidSession, fieldOf(err), err.Error())
 		return
 	}
 	s.cfg = next
@@ -529,17 +556,17 @@ func (s *Session) createItem(c CmdCreateItem, tag string) {
 	switch c.Item.Role {
 	case RoleUser, RoleAssistant, RoleSystem:
 	default:
-		s.emitError(tag, ErrCodeInvalidItem, fmt.Sprintf("unsupported role %q", c.Item.Role))
+		s.emitParamError(tag, ErrCodeInvalidItem, "item.role", fmt.Sprintf("unsupported role %q", c.Item.Role))
 		return
 	}
 	if c.Item.Text == "" {
-		s.emitError(tag, ErrCodeInvalidItem, "item text must not be empty")
+		s.emitParamError(tag, ErrCodeInvalidItem, "item.content", "item text must not be empty")
 		return
 	}
-	it := &item{Item: Item{Role: c.Item.Role, Content: ContentText, Status: ItemCompleted, Text: c.Item.Text, TranscriptDone: true}}
+	it := &item{Item: Item{ClientID: c.Item.ClientID, Role: c.Item.Role, Content: ContentText, Status: ItemCompleted, Text: c.Item.Text, TranscriptDone: true}}
 	prev, ok := s.conv.insert(it, c.PreviousItem, c.AtRoot)
 	if !ok {
-		s.emitError(tag, ErrCodeItemNotFound, fmt.Sprintf("previous item %d not found", c.PreviousItem))
+		s.emitParamError(tag, ErrCodeItemNotFound, "previous_item_id", "previous item not found")
 		return
 	}
 	s.emit(EvItemAdded{Item: it.snapshot(), PreviousItem: prev})
@@ -548,11 +575,11 @@ func (s *Session) createItem(c CmdCreateItem, tag string) {
 
 func (s *Session) deleteItem(ref ItemRef, tag string) {
 	if s.active != nil && s.active.item == ref {
-		s.emitError(tag, ErrCodeInvalidItem, "cannot delete the output item of an in-progress response")
+		s.emitParamError(tag, ErrCodeInvalidItem, "item_id", "cannot delete the output item of an in-progress response")
 		return
 	}
 	if !s.conv.remove(ref) {
-		s.emitError(tag, ErrCodeItemNotFound, fmt.Sprintf("item %d not found", ref))
+		s.emitParamError(tag, ErrCodeItemNotFound, "item_id", "item not found")
 		return
 	}
 	if s.pendingItem != nil && s.pendingItem.Ref == ref {
@@ -564,22 +591,23 @@ func (s *Session) deleteItem(ref ItemRef, tag string) {
 func (s *Session) truncateItem(c CmdTruncateItem, tag string) {
 	it, ok := s.conv.get(c.ID)
 	if !ok {
-		s.emitError(tag, ErrCodeItemNotFound, fmt.Sprintf("item %d not found", c.ID))
+		s.emitParamError(tag, ErrCodeItemNotFound, "item_id", "item not found")
 		return
 	}
 	if it.Role != RoleAssistant || it.Content != ContentAudio {
-		s.emitError(tag, ErrCodeItemNotTruncatable, "only assistant audio items can be truncated")
+		s.emitParamError(tag, ErrCodeItemNotTruncatable, "item_id", "only assistant audio items can be truncated")
 		return
 	}
 	if c.ContentIndex != 0 {
-		s.emitError(tag, ErrCodeInvalidItem, "content_index out of range")
-		return
-	}
-	if c.AudioEndMs < 0 {
-		s.emitError(tag, ErrCodeInvalidItem, "audio_end_ms must be >= 0")
+		s.emitParamError(tag, ErrCodeInvalidItem, "content_index", "content_index out of range")
 		return
 	}
 	cut := audio.MsToBytes(c.AudioEndMs)
+	if c.AudioEndMs < 0 || cut > it.audioB {
+		s.emitParamError(tag, ErrCodeTruncateOutOfRange, "audio_end_ms",
+			fmt.Sprintf("audio_end_ms must be within [0, %d]", it.AudioMs))
+		return
+	}
 	it.Text = trimText(it.Text, it.segments, it.alignment, cut, it.audioB)
 	if cut < it.audioB {
 		it.audioB = cut
@@ -758,7 +786,7 @@ func (s *Session) handleTranscriptTimeout() {
 	best := joinTranscript(s.transcriptAcc, s.partial)
 	if best == "" {
 		s.log.Warn("asr final timeout with no transcript; failing response", "response", r.ref)
-		s.failResponse(r, errors.New("no transcript before asr_final_timeout"))
+		s.failResponse(r, ErrCodeTranscriptTimeout, errors.New("no transcript before asr_final_timeout"))
 		return
 	}
 	s.log.Warn("asr final timeout; starting with partial transcript", "response", r.ref)
@@ -779,36 +807,49 @@ func (s *Session) stopASRWait() {
 // ---- responses -------------------------------------------------------------
 
 func (s *Session) createResponse(ov ResponseOverrides, tag string) {
+	probe := s.cfg.Clone()
 	if ov.OutputModalities != nil {
-		probe := s.cfg.Clone()
 		probe.OutputModalities = ov.OutputModalities
-		if err := probe.Validate("response"); err != nil {
-			s.emitError(tag, ErrCodeInvalidOverrides, err.Error())
+	}
+	if ov.MaxOutputTokens != nil {
+		probe.MaxOutputTokens = *ov.MaxOutputTokens
+	}
+	if ov.Voice != nil {
+		if *ov.Voice != s.cfg.Audio.Output.Voice && s.audioEmitted {
+			s.emitParamError(tag, ErrCodeVoiceLocked, "response.audio.output.voice", "voice cannot be changed after the session has produced audio")
 			return
 		}
+		probe.Audio.Output.Voice = *ov.Voice
+	}
+	if err := probe.Validate("response"); err != nil {
+		s.emitParamError(tag, ErrCodeInvalidOverrides, fieldOf(err), err.Error())
+		return
 	}
 	s.nextResp++
 	r := &response{
 		ref:          s.nextResp,
 		status:       ResponseInProgress,
 		awaiting:     true,
-		textOnly:     s.textOnly(ov.OutputModalities),
+		textOnly:     s.textOnly(probe.OutputModalities),
 		instructions: s.cfg.Instructions,
+		voice:        probe.Audio.Output.Voice,
 		tag:          tag,
 	}
 	if ov.Instructions != nil {
 		r.instructions = *ov.Instructions
 	}
-	maxTokens := s.cfg.MaxOutputTokens
-	if ov.MaxOutputTokens != nil {
-		maxTokens = *ov.MaxOutputTokens
-	}
-	if !maxTokens.Inf {
-		r.maxTokens = maxTokens.N
+	if !probe.MaxOutputTokens.Inf {
+		r.maxTokens = probe.MaxOutputTokens.N
 	}
 	s.active = r
 	s.responses++
-	s.emit(EvResponseCreated{Resp: r.ref})
+	s.emit(EvResponseCreated{
+		Resp:             r.ref,
+		OutputModalities: append([]string(nil), probe.OutputModalities...),
+		Voice:            r.voice,
+		MaxOutputTokens:  probe.MaxOutputTokens,
+		Metadata:         ov.Metadata,
+	})
 	s.turns.Step(responseStarted{})
 
 	if p := s.pendingItem; p != nil && !p.TranscriptDone {
@@ -830,9 +871,9 @@ func (s *Session) startPipeline(r *response) {
 		content = ContentText
 	}
 	out := &item{Item: Item{Role: RoleAssistant, Content: content, Status: ItemInProgress, TranscriptDone: true}}
-	s.conv.append(out)
+	prev := s.conv.append(out)
 	r.item = out.Ref
-	s.emit(EvOutputItemAdded{Resp: r.ref, Item: out.snapshot()})
+	s.emit(EvOutputItemAdded{Resp: r.ref, Item: out.snapshot(), PreviousItem: prev})
 
 	ctx, cancel := context.WithCancel(s.ctx)
 	r.cancel = cancel
@@ -843,7 +884,7 @@ func (s *Session) startPipeline(r *response) {
 			Messages:        s.conv.messages(),
 			MaxOutputTokens: r.maxTokens,
 		},
-		ttsCfg: s.ttsConfig(),
+		ttsCfg: s.ttsConfig(r.voice),
 		llm:    s.llm, tts: s.tts, out: s.respEvents,
 	}
 	chunks := make(chan string, textChunkQueue)
@@ -882,6 +923,7 @@ func (s *Session) handleResponseEvent(ev Event) {
 	case EvOutputAudioDelta:
 		out.audioB += len(e.PCM)
 		out.AudioMs = audio.BytesToMs(out.audioB)
+		s.audioEmitted = true
 		s.emit(e)
 	case pipeAlignment:
 		out.alignment = append(out.alignment, e.Timings...)
@@ -902,7 +944,7 @@ func (s *Session) handleResponseEvent(ev Event) {
 		s.maybeComplete(r)
 	case pipeError:
 		s.log.Error("pipeline error", "stage", e.Stage, "err", e.Err)
-		s.failResponse(r, e.Err)
+		s.failResponse(r, ErrCodeProviderError, e.Err)
 	}
 }
 
@@ -914,8 +956,9 @@ func (s *Session) maybeComplete(r *response) {
 	s.finish(r, status, reason, nil)
 }
 
-func (s *Session) failResponse(r *response, err error) {
-	s.emitError(r.tag, ErrCodeResponseFailed, err.Error())
+func (s *Session) failResponse(r *response, code string, err error) {
+	r.failCode = code
+	s.emitError(r.tag, code, err.Error())
 	s.finish(r, ResponseFailed, ReasonNone, err)
 }
 
@@ -952,14 +995,15 @@ func (s *Session) finish(r *response, status ResponseStatus, reason StatusReason
 			if r.textOnly {
 				s.emit(EvOutputTextDone{Resp: r.ref, Item: r.item, Text: out.Text})
 			} else {
-				s.emit(EvOutputAudioTranscriptDone{Resp: r.ref, Item: r.item, Text: out.Text})
+				// Profile §7: audio done precedes transcript done.
 				s.emit(EvOutputAudioDone{Resp: r.ref, Item: r.item})
+				s.emit(EvOutputAudioTranscriptDone{Resp: r.ref, Item: r.item, Text: out.Text})
 			}
 			s.emit(EvOutputItemDone{Resp: r.ref, Item: out.snapshot()})
 			output = []Item{out.snapshot()}
 		}
 	}
-	s.emit(EvResponseDone{Resp: r.ref, Status: status, Reason: reason, Err: err, Usage: r.usage, Output: output})
+	s.emit(EvResponseDone{Resp: r.ref, Status: status, Reason: reason, ErrCode: r.failCode, Err: err, Usage: r.usage, Output: output})
 	s.active = nil
 	s.turns.Step(responseEnded{})
 	s.activeGen++ // any late pipeline event is now stale

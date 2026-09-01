@@ -53,9 +53,11 @@ const (
 )
 
 // Item is a conversation entry as seen from outside the actor. Audio items
-// carry their transcript in Text; raw user audio is not retained.
+// carry their transcript in Text; raw user audio is not retained. ClientID is
+// an opaque label supplied at creation that the session never interprets.
 type Item struct {
 	Ref            ItemRef
+	ClientID       string
 	Role           Role
 	Content        ContentKind
 	Status         ItemStatus
@@ -66,8 +68,9 @@ type Item struct {
 
 // ItemSpec describes a client-created text item.
 type ItemSpec struct {
-	Role Role
-	Text string
+	Role     Role
+	Text     string
+	ClientID string
 }
 
 // ResponseStatus is the five-state protocol-aligned FSM.
@@ -116,11 +119,14 @@ type SessionPatch struct {
 }
 
 // ResponseOverrides is the internal form of response.create's per-response
-// overrides; nil means "use the session value".
+// overrides; nil means "use the session value". Metadata is opaque and only
+// echoed back on EvResponseCreated.
 type ResponseOverrides struct {
 	Instructions     *string
 	OutputModalities []string
 	MaxOutputTokens  *config.MaxOutputTokens
+	Voice            *string
+	Metadata         map[string]string
 }
 
 // ---- Commands (into the actor, express intent) -----------------------------
@@ -194,11 +200,13 @@ type Event interface{ isEvent() }
 type EvSessionUpdated struct{ Config config.SessionDefaults }
 
 // EvError reports a non-fatal or fatal problem. Tag echoes the command tag
-// when the error was caused by a command.
+// when the error was caused by a command; Param names the offending field
+// (dotted path) when there is one.
 type EvError struct {
 	Tag     string
 	Code    string
 	Message string
+	Param   string
 	Fatal   bool
 }
 
@@ -241,11 +249,20 @@ type EvInputTranscriptDone struct {
 	Text string
 }
 
-type EvResponseCreated struct{ Resp ResponseRef }
+// EvResponseCreated carries the effective per-response parameters so the
+// protocol layer can echo the response object without guessing.
+type EvResponseCreated struct {
+	Resp             ResponseRef
+	OutputModalities []string
+	Voice            string
+	MaxOutputTokens  config.MaxOutputTokens
+	Metadata         map[string]string
+}
 
 type EvOutputItemAdded struct {
-	Resp ResponseRef
-	Item Item
+	Resp         ResponseRef
+	Item         Item
+	PreviousItem ItemRef
 }
 
 // Delta events are produced by pipeline goroutines and therefore carry Gen.
@@ -293,12 +310,13 @@ type EvOutputItemDone struct {
 }
 
 type EvResponseDone struct {
-	Resp   ResponseRef
-	Status ResponseStatus
-	Reason StatusReason
-	Err    error
-	Usage  Usage
-	Output []Item
+	Resp    ResponseRef
+	Status  ResponseStatus
+	Reason  StatusReason
+	ErrCode string // Cascade error code when Status is failed
+	Err     error
+	Usage   Usage
+	Output  []Item
 }
 
 type EvSessionClosed struct{ Reason CloseReason }
@@ -331,16 +349,19 @@ func (EvSessionClosed) isEvent()              {}
 // PROTOCOL-VERIFY: codes are internal identifiers; the protocol layer maps
 // them onto GA error.code values in Phase 2.
 const (
-	ErrCodeInvalidSession     = "invalid_session_update"
-	ErrCodeBufferEmpty        = "input_audio_buffer_commit_empty"
-	ErrCodeBufferOverflow     = "input_audio_buffer_overflow"
-	ErrCodeInputQueueOverflow = "input_queue_overflow"
-	ErrCodeItemNotFound       = "item_not_found"
-	ErrCodeItemNotTruncatable = "item_not_truncatable"
-	ErrCodeInvalidItem        = "invalid_item"
-	ErrCodeResponseInProgress = "response_in_progress"
-	ErrCodeResponseFailed     = "response_failed"
-	ErrCodeProviderError      = "provider_error"
-	ErrCodeInvalidOverrides   = "invalid_response_overrides"
-	ErrCodeTranscriptTimeout  = "transcript_timeout"
+	ErrCodeInvalidSession          = "invalid_session_update"
+	ErrCodeBufferEmpty             = "input_audio_buffer_commit_empty"
+	ErrCodeBufferOverflow          = "input_audio_buffer_overflow"
+	ErrCodeInputQueueOverflow      = "input_queue_overflow"
+	ErrCodeItemNotFound            = "item_not_found"
+	ErrCodeItemNotTruncatable      = "item_not_truncatable"
+	ErrCodeInvalidItem             = "invalid_item"
+	ErrCodeResponseInProgress      = "response_in_progress"
+	ErrCodeResponseFailed          = "response_failed"
+	ErrCodeProviderError           = "provider_error"
+	ErrCodeInvalidOverrides        = "invalid_response_overrides"
+	ErrCodeTranscriptTimeout       = "transcript_timeout"
+	ErrCodeResponseCancelNotActive = "response_cancel_not_active"
+	ErrCodeTruncateOutOfRange      = "item_truncate_out_of_range"
+	ErrCodeVoiceLocked             = "voice_locked"
 )

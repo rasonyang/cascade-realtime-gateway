@@ -136,6 +136,7 @@ func (l *Limits) validate(prefix string) error {
 		{"input_audio_queue_frames", l.InputAudioQueueFrames},
 		{"input_audio_buffer_max_ms", l.InputAudioBufferMaxMs},
 		{"output_event_queue", l.OutputEventQueue},
+		{"client_max_message_bytes", l.ClientMaxMessageBytes},
 	}
 	for _, f := range ints {
 		if f.v <= 0 {
