@@ -15,6 +15,12 @@ put a TLS terminator in front of it for `wss://` (the official OpenAI SDKs requi
 Architecture rules live in `CLAUDE.md`; the implementation plan in `docs/implementation-brief.md`;
 the protocol compatibility profile in `docs/protocol-profile.md` (Phase 2).
 
+## Observability
+
+Set `observability.otel_endpoint` to an OTLP/HTTP collector (`"127.0.0.1:4318"`) to export spans
+(`session → response → llm/tts`) and the core latency metrics (`cascade.*`); leave it empty to disable.
+Logs are JSON on stdout with secret fields redacted; provider lifecycle facts are logged at `debug`.
+
 ## Tests
 
 ```sh

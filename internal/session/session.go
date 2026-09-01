@@ -9,8 +9,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/rasonyang/cascade-realtime-gateway/internal/audio"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/config"
+	"github.com/rasonyang/cascade-realtime-gateway/internal/observability"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/provider"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/recorder"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/vad"
@@ -27,6 +33,8 @@ type Options struct {
 	TTS      provider.TTS
 	Logger   *slog.Logger
 	Recorder recorder.Recorder
+	// Telemetry is optional; nil records nothing.
+	Telemetry *observability.Telemetry
 }
 
 // Errors returned by Post / PostAudio.
@@ -53,6 +61,8 @@ type Session struct {
 	tts    provider.TTS
 	log    *slog.Logger
 	rec    recorder.Recorder
+	tel    *observability.Telemetry
+	span   trace.Span // session span; response spans are its children
 
 	ctx    context.Context
 	cancel context.CancelCauseFunc
@@ -88,6 +98,10 @@ type Session struct {
 	speechItem    ItemRef   // pre-allocated at speech start, reused by commit
 	pendingItem   *item     // committed audio item awaiting its transcript
 	committedAt   time.Time // when pendingItem was committed; commit→final latency
+	speechStartAt time.Time // VAD speech start of the current turn (metrics)
+	speechEndAt   time.Time // VAD speech stop of the current turn (metrics)
+	interruptAt   time.Time // interrupt trigger (speech start or cancel command)
+	firstPartial  bool      // a partial has been recorded for the current turn
 	transcriptAcc string    // Finals accumulated since the last commit
 	partial       string    // latest ASR partial
 
@@ -107,6 +121,10 @@ func New(opts Options) *Session {
 	if log == nil {
 		log = slog.Default()
 	}
+	tel := opts.Telemetry
+	if tel == nil {
+		tel = observability.Noop()
+	}
 	cfg := opts.Session.Clone()
 	if td := cfg.Audio.Input.TurnDetection; td != nil {
 		td.ApplyDefaults() // DefaultConfig leaves mode-specific fields nil
@@ -120,6 +138,7 @@ func New(opts Options) *Session {
 		tts:        opts.TTS,
 		log:        log.With("session_id", opts.ID),
 		rec:        opts.Recorder,
+		tel:        tel,
 		cmds:       make(chan cmdEnvelope, opts.Limits.OutputEventQueue),
 		audioIn:    make(chan audioFrame, opts.Limits.InputAudioQueueFrames),
 		respEvents: make(chan Event, opts.Limits.OutputEventQueue),
@@ -134,14 +153,20 @@ func New(opts Options) *Session {
 
 // Start opens the ASR stream and launches the actor goroutine.
 func (s *Session) Start(ctx context.Context) error {
+	ctx, s.span = s.tel.Tracer.Start(ctx, "session", trace.WithAttributes(observability.KeySessionID.String(s.id)))
 	s.ctx, s.cancel = context.WithCancelCause(ctx)
 	stream, err := s.asr.OpenStream(s.ctx, s.asrConfig())
 	if err != nil {
 		s.cancel(closeError{CloseProviderError})
+		s.tel.Metrics.ProviderErrors.Add(ctx, 1, metric.WithAttributes(observability.KeyProvider.String("asr")))
+		s.span.RecordError(err)
+		s.span.SetStatus(codes.Error, "asr open failed")
+		s.span.End()
 		close(s.events)
 		close(s.done)
 		return fmt.Errorf("open asr stream: %w", err)
 	}
+	s.tel.Metrics.SessionsActive.Add(ctx, 1)
 	s.asrStream = stream
 	s.asrEvents = stream.Events()
 	s.startedAt = time.Now()
@@ -369,6 +394,11 @@ func (s *Session) cleanup() {
 	case <-time.After(s.limits.ClientWriteTimeout.Std()):
 	}
 	close(s.events)
+	bg := context.Background()
+	s.tel.Metrics.SessionsActive.Add(bg, -1)
+	s.tel.Metrics.SessionsEnded.Add(bg, 1, metric.WithAttributes(observability.KeyReason.String(string(reason))))
+	s.span.SetAttributes(observability.KeyReason.String(string(reason)), attribute.Int("cascade.items", s.conv.count()), attribute.Int("cascade.responses", s.responses))
+	s.span.End()
 	if s.rec != nil {
 		summary := recorder.Summary{
 			SessionID: s.id, StartedAt: s.startedAt, EndedAt: time.Now(),
@@ -510,6 +540,7 @@ func (s *Session) handleCommand(cmd Command) {
 			s.emitParamError(tag, ErrCodeResponseCancelNotActive, "response_id", "response is not in progress")
 			return
 		}
+		s.interruptAt = time.Now()
 		s.interrupt(ReasonClientCancelled)
 	case CmdClose:
 		s.cancel(closeError{c.Reason})
@@ -629,6 +660,7 @@ func (s *Session) handleAudio(pcm []byte) {
 		return
 	}
 	if err := s.asrStream.PushAudio(pcm); err != nil {
+		s.tel.Metrics.ProviderErrors.Add(s.ctx, 1, metric.WithAttributes(observability.KeyProvider.String("asr")))
 		s.fatal(ErrCodeProviderError, "asr: "+err.Error(), CloseProviderError)
 		return
 	}
@@ -645,9 +677,12 @@ func (s *Session) handleAudio(pcm []byte) {
 			s.disarmEndOfTurn()
 			d := s.turns.Step(vadSpeechStart{})
 			if d.EmitSpeechStarted {
+				s.speechStartAt = time.Now()
+				s.firstPartial = false
 				s.emit(EvSpeechStarted{AudioStartMs: startMs, Item: s.speechItem})
 			}
 			if d.Interrupt {
+				s.interruptAt = time.Now()
 				s.interrupt(ReasonTurnDetected)
 			}
 			s.apply(d, "")
@@ -655,6 +690,7 @@ func (s *Session) handleAudio(pcm []byte) {
 			endMs := s.buffer.markSpeechEnd(ev.OffsetMs, s.vadSilenceMs())
 			d := s.turns.Step(vadSpeechEnd{})
 			if d.EmitSpeechStopped {
+				s.speechEndAt = time.Now()
 				s.emit(EvSpeechStopped{AudioEndMs: endMs, Item: s.speechItem})
 			}
 			s.apply(d, "")
@@ -706,6 +742,11 @@ func (s *Session) commit(tag string) {
 	prev := s.conv.append(it)
 	s.pendingItem = it
 	s.committedAt = time.Now()
+	if s.detector == nil {
+		// Manual mode: the commit is the only turn boundary the metrics can use.
+		s.speechStartAt, s.speechEndAt = s.committedAt, s.committedAt
+		s.firstPartial = false
+	}
 	s.emit(EvAudioBufferCommitted{Item: ref, PreviousItem: prev})
 	s.emit(EvItemAdded{Item: it.snapshot(), PreviousItem: prev})
 	if err := s.asrStream.Finalize(); err != nil {
@@ -743,6 +784,10 @@ func (s *Session) handleASR(ev provider.ASREvent) {
 	switch ev.Kind {
 	case provider.ASRPartial:
 		s.partial = ev.Text
+		if !s.firstPartial && !s.speechStartAt.IsZero() && ev.Text != "" {
+			s.firstPartial = true
+			s.tel.Metrics.ASRFirstTranscriptMs.Record(s.ctx, millis(time.Since(s.speechStartAt)))
+		}
 	case provider.ASRFinal:
 		s.partial = ""
 		if s.pendingItem != nil {
@@ -758,6 +803,7 @@ func (s *Session) handleASR(ev provider.ASREvent) {
 		}
 		s.apply(s.turns.Step(asrEndOfTurn{}), "")
 	case provider.ASRError:
+		s.tel.Metrics.ProviderErrors.Add(s.ctx, 1, metric.WithAttributes(observability.KeyProvider.String("asr")))
 		s.fatal(ErrCodeProviderError, "asr: "+ev.Err.Error(), CloseProviderError)
 	}
 }
@@ -768,9 +814,12 @@ func (s *Session) completePendingItem(text, delta string) {
 	it := s.pendingItem
 	s.pendingItem = nil
 	s.transcriptAcc = ""
-	// Core metric: commit → ASR Final. Logged per turn now; Phase 5 exports
-	// it as a histogram.
-	s.log.Info("transcript final", "item", it.Ref, "commit_to_final_ms", time.Since(s.committedAt).Milliseconds(), "chars", len(text))
+	commitToFinal := time.Since(s.committedAt)
+	s.tel.Metrics.CommitToFinalMs.Record(s.ctx, millis(commitToFinal))
+	if !s.speechEndAt.IsZero() {
+		s.tel.Metrics.ASRFinalTranscriptMs.Record(s.ctx, millis(time.Since(s.speechEndAt)))
+	}
+	s.log.Info("transcript final", "item", it.Ref, "commit_to_final_ms", commitToFinal.Milliseconds(), "chars", len(text))
 	it.Text = text
 	it.TranscriptDone = true
 	it.Status = ItemCompleted
@@ -843,7 +892,15 @@ func (s *Session) createResponse(ov ResponseOverrides, tag string) {
 		instructions: s.cfg.Instructions,
 		voice:        probe.Audio.Output.Voice,
 		tag:          tag,
+		anchorAt:     time.Now(),
 	}
+	if p := s.pendingItem; p != nil && !s.committedAt.IsZero() {
+		r.anchorAt = s.committedAt // E2E latency starts at the user's turn end
+	}
+	r.ctx, r.span = s.tel.Tracer.Start(s.ctx, "response", trace.WithAttributes(
+		observability.KeyResponseID.Int64(int64(r.ref)),
+		observability.KeyModalities.StringSlice(probe.OutputModalities),
+	))
 	if ov.Instructions != nil {
 		r.instructions = *ov.Instructions
 	}
@@ -884,8 +941,10 @@ func (s *Session) startPipeline(r *response) {
 	r.item = out.Ref
 	s.emit(EvOutputItemAdded{Resp: r.ref, Item: out.snapshot(), PreviousItem: prev})
 
-	ctx, cancel := context.WithCancel(s.ctx)
+	ctx, cancel := context.WithCancel(r.ctx)
 	r.cancel = cancel
+	r.startedAt = time.Now()
+	ctx, r.llmSpan = s.tel.Tracer.Start(ctx, "llm")
 	p := &pipeline{
 		ctx: ctx, gen: r.gen, resp: r.ref, item: r.item, textOnly: r.textOnly,
 		req: provider.ChatRequest{
@@ -925,15 +984,27 @@ func (s *Session) handleResponseEvent(ev Event) {
 	switch e := ev.(type) {
 	case EvOutputTextDelta:
 		out.Text += e.Delta
+		s.noteFirstText(r)
 		s.emit(e)
 	case EvOutputAudioTranscriptDelta:
 		out.Text += e.Delta
+		s.noteFirstText(r)
 		s.emit(e)
 	case EvOutputAudioDelta:
 		out.audioB += len(e.PCM)
 		out.AudioMs = audio.BytesToMs(out.audioB)
 		s.audioEmitted = true
+		if r.firstAudioAt.IsZero() {
+			r.firstAudioAt = time.Now()
+			if !r.ttsStartedAt.IsZero() {
+				s.tel.Metrics.TTSFirstAudioMs.Record(s.ctx, millis(r.firstAudioAt.Sub(r.ttsStartedAt)))
+			}
+			s.tel.Metrics.E2EMs.Record(s.ctx, millis(r.firstAudioAt.Sub(r.anchorAt)))
+		}
 		s.emit(e)
+	case pipeTTSStart:
+		r.ttsStartedAt = time.Now()
+		_, r.ttsSpan = s.tel.Tracer.Start(r.ctx, "tts")
 	case pipeAlignment:
 		out.alignment = append(out.alignment, e.Timings...)
 	case pipeSegment:
@@ -942,10 +1013,21 @@ func (s *Session) handleResponseEvent(ev Event) {
 		r.llmDone = true
 		r.finish = e.Finish
 		r.usage = e.Usage
+		if r.llmSpan != nil {
+			r.llmSpan.SetAttributes(attribute.String("cascade.finish_reason", string(e.Finish)),
+				attribute.Int("cascade.input_tokens", e.Usage.InputTokens), attribute.Int("cascade.output_tokens", e.Usage.OutputTokens))
+			r.llmSpan.End()
+			r.llmSpan = nil
+		}
 		s.maybeComplete(r)
 	case pipeTTSDone:
 		r.ttsDone = true
 		r.audioFlushed = true // deltas precede this event on the same channel
+		if r.ttsSpan != nil {
+			r.ttsSpan.SetAttributes(attribute.Int("cascade.audio_ms", out.AudioMs))
+			r.ttsSpan.End()
+			r.ttsSpan = nil
+		}
 		if len(out.segments) == 0 && len(out.alignment) == 0 {
 			// Incremental provider without alignment: tier-3 single segment.
 			out.segments = []audioSegment{{textStart: 0, textEnd: len(out.Text), audioStart: 0, audioEnd: out.audioB}}
@@ -953,6 +1035,13 @@ func (s *Session) handleResponseEvent(ev Event) {
 		s.maybeComplete(r)
 	case pipeError:
 		s.log.Error("pipeline error", "stage", e.Stage, "err", e.Err)
+		s.tel.Metrics.ProviderErrors.Add(s.ctx, 1, metric.WithAttributes(observability.KeyProvider.String(e.Stage)))
+		if e.Stage == "llm" && r.llmSpan != nil {
+			r.llmSpan.RecordError(e.Err)
+		}
+		if e.Stage == "tts" && r.ttsSpan != nil {
+			r.ttsSpan.RecordError(e.Err)
+		}
 		s.failResponse(r, ErrCodeProviderError, e.Err)
 	}
 }
@@ -1016,4 +1105,36 @@ func (s *Session) finish(r *response, status ResponseStatus, reason StatusReason
 	s.active = nil
 	s.turns.Step(responseEnded{})
 	s.activeGen++ // any late pipeline event is now stale
+
+	if status == ResponseCancelled && !s.interruptAt.IsZero() {
+		s.tel.Metrics.InterruptMs.Record(s.ctx, millis(time.Since(s.interruptAt)))
+		s.interruptAt = time.Time{}
+	}
+	for _, sp := range []trace.Span{r.llmSpan, r.ttsSpan} {
+		if sp != nil {
+			sp.SetAttributes(observability.KeyStatus.String(string(status)))
+			sp.End()
+		}
+	}
+	r.llmSpan, r.ttsSpan = nil, nil
+	r.span.SetAttributes(observability.KeyStatus.String(string(status)), observability.KeyReason.String(string(reason)))
+	if err != nil {
+		r.span.RecordError(err)
+		r.span.SetStatus(codes.Error, string(status))
+	}
+	r.span.End()
 }
+
+// noteFirstText records LLM TTFT (and E2E for text-only responses).
+func (s *Session) noteFirstText(r *response) {
+	if !r.firstTextAt.IsZero() {
+		return
+	}
+	r.firstTextAt = time.Now()
+	s.tel.Metrics.LLMTTFTMs.Record(s.ctx, millis(r.firstTextAt.Sub(r.startedAt)))
+	if r.textOnly {
+		s.tel.Metrics.E2EMs.Record(s.ctx, millis(r.firstTextAt.Sub(r.anchorAt)))
+	}
+}
+
+func millis(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }

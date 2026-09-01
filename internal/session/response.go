@@ -2,6 +2,9 @@ package session
 
 import (
 	"context"
+	"time"
+
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/rasonyang/cascade-realtime-gateway/internal/provider"
 )
@@ -30,6 +33,18 @@ type response struct {
 	finish       provider.FinishReason
 	usage        Usage
 	tag          string
+
+	// Observability: the response span and its llm / tts children, plus the
+	// timestamps the core latency metrics are derived from.
+	ctx          context.Context // response span context; the pipeline ctx derives from it
+	span         trace.Span
+	llmSpan      trace.Span
+	ttsSpan      trace.Span
+	anchorAt     time.Time // commit of the user turn, or response.create for text turns
+	startedAt    time.Time // pipeline start (LLM request issued)
+	ttsStartedAt time.Time // first sentence handed to TTS
+	firstTextAt  time.Time
+	firstAudioAt time.Time
 }
 
 // terminal reports whether the response has left in_progress.
@@ -71,6 +86,9 @@ type pipeLLMDone struct {
 
 type pipeTTSDone struct{ Gen Generation }
 
+// pipeTTSStart marks the first sentence being handed to the TTS provider.
+type pipeTTSStart struct{ Gen Generation }
+
 type pipeSegment struct {
 	Gen Generation
 	Seg audioSegment
@@ -89,12 +107,14 @@ type pipeError struct {
 
 func (pipeLLMDone) isEvent()   {}
 func (pipeTTSDone) isEvent()   {}
+func (pipeTTSStart) isEvent()  {}
 func (pipeSegment) isEvent()   {}
 func (pipeAlignment) isEvent() {}
 func (pipeError) isEvent()     {}
 
 func (e pipeLLMDone) generation() Generation   { return e.Gen }
 func (e pipeTTSDone) generation() Generation   { return e.Gen }
+func (e pipeTTSStart) generation() Generation  { return e.Gen }
 func (e pipeSegment) generation() Generation   { return e.Gen }
 func (e pipeAlignment) generation() Generation { return e.Gen }
 func (e pipeError) generation() Generation     { return e.Gen }

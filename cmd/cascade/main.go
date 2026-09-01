@@ -82,7 +82,12 @@ func run(args []string) int {
 		fmt.Fprintf(os.Stderr, "cascade: providers: %v\n", err)
 		return 1
 	}
-	srv := server.New(server.Options{Config: cfg, Providers: providers, Logger: log, Recorder: recorder.Slog{Log: log}})
+	tel, err := observability.Setup(context.Background(), cfg.Observability.OTelEndpoint)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cascade: otel: %v\n", err)
+		return 1
+	}
+	srv := server.New(server.Options{Config: cfg, Providers: providers, Logger: log, Recorder: recorder.Slog{Log: log}, Telemetry: tel})
 	httpSrv := &http.Server{Addr: cfg.Listen, Handler: srv.Handler()}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -107,6 +112,12 @@ func run(args []string) int {
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			log.Warn("shutdown incomplete", "err", err)
 		}
+	}
+	// Flush spans and metrics before exit.
+	flushCtx, cancel := context.WithTimeout(context.Background(), cfg.Limits.ClientWriteTimeout.Std())
+	defer cancel()
+	if err := tel.Shutdown(flushCtx); err != nil {
+		log.Warn("telemetry flush incomplete", "err", err)
 	}
 	return 0
 }

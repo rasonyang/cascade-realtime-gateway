@@ -128,10 +128,17 @@ func (p *pipeline) ttsStage(sentences <-chan sentence) {
 
 func (p *pipeline) ttsPerSentence(sentences <-chan sentence) {
 	audioPos := 0
+	started := false
 	for sn := range sentences {
 		seg := audioSegment{textStart: sn.Start, textEnd: sn.End, audioStart: audioPos}
 		text := strings.TrimSpace(sn.Text)
 		if text != "" {
+			if !started {
+				started = true
+				if !p.send(pipeTTSStart{Gen: p.gen}) {
+					return
+				}
+			}
 			n, ok := p.synthesizeOne(text)
 			if !ok {
 				return
@@ -167,6 +174,9 @@ func (p *pipeline) synthesizeOne(text string) (int, bool) {
 }
 
 func (p *pipeline) ttsIncremental(sentences <-chan sentence) {
+	if !p.send(pipeTTSStart{Gen: p.gen}) {
+		return
+	}
 	stream, err := p.tts.Synthesize(p.ctx, p.ttsCfg)
 	if err != nil {
 		p.fail("tts", err)

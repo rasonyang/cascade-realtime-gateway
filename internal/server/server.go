@@ -21,6 +21,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/rasonyang/cascade-realtime-gateway/internal/config"
+	"github.com/rasonyang/cascade-realtime-gateway/internal/observability"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/protocol"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/provider"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/recorder"
@@ -40,6 +41,7 @@ type Options struct {
 	Providers Providers
 	Logger    *slog.Logger
 	Recorder  recorder.Recorder
+	Telemetry *observability.Telemetry // nil records nothing
 }
 
 // Server owns the connection lifecycle. Its root context is cancelled by
@@ -49,6 +51,7 @@ type Server struct {
 	prov Providers
 	log  *slog.Logger
 	rec  recorder.Recorder
+	tel  *observability.Telemetry
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -69,7 +72,7 @@ func New(opts Options) *Server {
 		log = slog.Default()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Server{cfg: opts.Config, prov: opts.Providers, log: log, rec: opts.Recorder, ctx: ctx, cancel: cancel}
+	return &Server{cfg: opts.Config, prov: opts.Providers, log: log, rec: opts.Recorder, tel: opts.Telemetry, ctx: ctx, cancel: cancel}
 }
 
 // Handler returns the HTTP handler serving RealtimePath.
@@ -179,7 +182,7 @@ func (s *Server) serve(conn *websocket.Conn, model string) {
 	log := s.log.With("session_id", id)
 	sess := session.New(session.Options{
 		ID: id, Session: s.cfg.SessionDefaults, Limits: s.cfg.Limits,
-		ASR: s.prov.ASR, LLM: s.prov.LLM, TTS: s.prov.TTS, Logger: s.log, Recorder: s.rec,
+		ASR: s.prov.ASR, LLM: s.prov.LLM, TTS: s.prov.TTS, Logger: s.log, Recorder: s.rec, Telemetry: s.tel,
 	})
 	if err := sess.Start(ctx); err != nil {
 		log.Error("session start failed", "err", err)
