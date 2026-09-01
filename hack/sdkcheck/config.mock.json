@@ -1,11 +1,17 @@
 {
   "listen": "127.0.0.1:18080",
   "auth": { "api_key": "{env.REALTIME_API_KEY}" },
-  "providers": {
-    "asr": { "type": "mock", "options": { "utterances": ["hello there"] } },
-    "llm": { "type": "mock", "options": { "tokens": ["Hello", " from", " Cascade.", " How", " can", " I", " help?"] } },
-    "tts": { "type": "mock", "options": { "ms_per_rune": 10 } }
-  },
-  "session_defaults": { "instructions": "You are Cascade." },
-  "observability": { "log_level": "info" }
+  "admin": { "state_file": "sdkcheck-state.json" },
+  "observability": { "log_level": "info" },
+  "bootstrap": {
+    "providers": {
+      "mock-asr": { "name": "mock-asr", "type": "mock", "api_key": "unused", "options": { "utterances": ["hello there"] } },
+      "mock-llm": { "name": "mock-llm", "type": "mock", "api_key": "unused", "options": { "tokens": ["Hello", " from", " Cascade.", " How", " can", " I", " help?"] } },
+      "mock-tts": { "name": "mock-tts", "type": "mock", "api_key": "unused", "options": { "ms_per_rune": 10 } }
+    },
+    "profiles": {
+      "default": { "name": "default", "asr": "mock-asr", "llm": "mock-llm", "tts": "mock-tts", "instructions": "You are Cascade." }
+    },
+    "settings": { "default_profile": "default" }
+  }
 }

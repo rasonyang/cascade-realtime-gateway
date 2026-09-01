@@ -16,6 +16,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/rasonyang/cascade-realtime-gateway/internal/admin"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/audio"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/config"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/provider/mock"
@@ -32,21 +33,34 @@ type fixture struct {
 	llm  *mock.LLM
 }
 
-func newFixture(t *testing.T, llmScript mock.LLMScript, tweak func(*config.Config)) *fixture {
+// stubResolver serves one fixed runtime configuration. The Admin store is
+// exercised in internal/admin and in admin_test.go; these tests need direct
+// handles on the mock providers instead.
+type stubResolver struct{ rt admin.Runtime }
+
+func (s stubResolver) Resolve() (admin.Runtime, error) { return s.rt, nil }
+
+func newFixture(t *testing.T, llmScript mock.LLMScript, tweak func(*config.Config, *config.Profile)) *fixture {
 	t.Helper()
 	cfg := config.DefaultConfig()
 	cfg.Auth.APIKey = apiKey
 	cfg.Limits.ClientWriteTimeout = config.Duration(300 * time.Millisecond)
 	cfg.Limits.ASRFinalTimeout = config.Duration(time.Second)
+	prof := config.DefaultProfile()
+	prof.Name, prof.ASR, prof.LLM, prof.TTS = "test", "asr", "llm", "tts"
 	if tweak != nil {
-		tweak(cfg)
+		tweak(cfg, prof)
 	}
 	llm := mock.NewLLM(llmScript)
-	srv := New(Options{Config: cfg, Providers: Providers{
-		ASR: mock.NewASR(mock.ASRScript{Utterances: []string{"hello there"}}),
-		LLM: llm,
-		TTS: mock.NewTTS(mock.TTSScript{MsPerRune: 10}),
-	}})
+	rt := admin.Runtime{
+		Profile: prof.Name, ASRName: prof.ASR, LLMName: prof.LLM, TTSName: prof.TTS,
+		Session:     prof.SessionDefaults(),
+		Temperature: prof.Temperature,
+		ASR:         mock.NewASR(mock.ASRScript{Utterances: []string{"hello there"}}),
+		LLM:         llm,
+		TTS:         mock.NewTTS(mock.TTSScript{MsPerRune: 10}),
+	}
+	srv := New(Options{Config: cfg, Resolver: stubResolver{rt}})
 	hs := httptest.NewServer(srv.Handler())
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), waitTimeout)
@@ -287,7 +301,7 @@ func TestBinaryFrameRejected(t *testing.T) {
 }
 
 func TestMaxSessions(t *testing.T) {
-	f := newFixture(t, defaultLLM(), func(c *config.Config) { c.Limits.MaxSessions = 1 })
+	f := newFixture(t, defaultLLM(), func(c *config.Config, _ *config.Profile) { c.Limits.MaxSessions = 1 })
 	c1 := f.connect()
 	c1.readUntil("conversation.created")
 	_, resp, err := f.dial("", apiKey)
@@ -301,7 +315,9 @@ func TestMaxSessions(t *testing.T) {
 }
 
 func TestSessionTimeoutCloses(t *testing.T) {
-	f := newFixture(t, defaultLLM(), func(c *config.Config) { c.Limits.SessionTimeout = config.Duration(200 * time.Millisecond) })
+	f := newFixture(t, defaultLLM(), func(c *config.Config, _ *config.Profile) {
+		c.Limits.SessionTimeout = config.Duration(200 * time.Millisecond)
+	})
 	c := f.connect()
 	c.readUntil("conversation.created")
 	code, reason := c.expectClose()
@@ -312,9 +328,9 @@ func TestSessionTimeoutCloses(t *testing.T) {
 }
 
 func TestFatalErrorClosesWith1011(t *testing.T) {
-	f := newFixture(t, defaultLLM(), func(c *config.Config) {
+	f := newFixture(t, defaultLLM(), func(c *config.Config, p *config.Profile) {
 		c.Limits.InputAudioBufferMaxMs = 40
-		c.SessionDefaults.Audio.Input.TurnDetection = nil
+		p.TurnDetection = nil
 	})
 	c := f.connect()
 	c.readUntil("conversation.created")
@@ -331,7 +347,7 @@ func TestFatalErrorClosesWith1011(t *testing.T) {
 }
 
 func TestReadLimitCloses(t *testing.T) {
-	f := newFixture(t, defaultLLM(), func(c *config.Config) { c.Limits.ClientMaxMessageBytes = 256 })
+	f := newFixture(t, defaultLLM(), func(c *config.Config, _ *config.Profile) { c.Limits.ClientMaxMessageBytes = 256 })
 	c := f.connect()
 	c.readUntil("conversation.created")
 	c.send(`{"type":"input_audio_buffer.append","audio":"` + strings.Repeat("A", 1024) + `"}`)
@@ -347,7 +363,7 @@ func TestSlowClientIsDisconnected(t *testing.T) {
 	for i := range big.Tokens {
 		big.Tokens[i] = strings.Repeat("x", 250)
 	}
-	f := newFixture(t, big, func(c *config.Config) { c.Limits.OutputEventQueue = 8 })
+	f := newFixture(t, big, func(c *config.Config, _ *config.Profile) { c.Limits.OutputEventQueue = 8 })
 	c := f.connect()
 	c.readUntil("conversation.created")
 	c.send(`{"type":"session.update","session":{"type":"realtime","output_modalities":["text"]}}`)
@@ -402,7 +418,7 @@ func TestNoConnectionLeak(t *testing.T) {
 // baseline afterwards.
 func TestConcurrentInterrupts(t *testing.T) {
 	sc := mock.LLMScript{Tokens: []string{"Hello", " again"}, Block: true, BlockAfter: 1}
-	f := newFixture(t, sc, func(c *config.Config) { c.SessionDefaults.Audio.Input.TurnDetection = nil })
+	f := newFixture(t, sc, func(_ *config.Config, p *config.Profile) { p.TurnDetection = nil })
 	baseline := runtime.NumGoroutine()
 	const sessions, rounds = 100, 10
 	var wg sync.WaitGroup

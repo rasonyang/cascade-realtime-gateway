@@ -35,6 +35,7 @@ type Metrics struct {
 	ProviderErrors       metric.Int64Counter     // attr provider=asr|llm|tts
 	SessionsEnded        metric.Int64Counter     // attr reason
 	SessionsActive       metric.Int64UpDownCounter
+	AdminConfigWrites    metric.Int64Counter // attr result=ok|invalid|conflict|persist_error
 }
 
 // Telemetry bundles the tracer and instruments a session uses.
@@ -53,6 +54,11 @@ var (
 	KeyReason     = attribute.Key("cascade.reason")
 	KeyStatus     = attribute.Key("cascade.status")
 	KeyModalities = attribute.Key("cascade.output_modalities")
+	KeyResult     = attribute.Key("cascade.result")
+	KeyProfile    = attribute.Key("cascade.profile")
+	KeyASR        = attribute.Key("cascade.asr")
+	KeyLLM        = attribute.Key("cascade.llm")
+	KeyTTS        = attribute.Key("cascade.tts")
 )
 
 // Setup builds exporters for an OTLP/HTTP endpoint ("host:port"); an empty
@@ -111,6 +117,7 @@ func New(tp trace.TracerProvider, mp metric.MeterProvider) *Telemetry {
 			ProviderErrors:       counter("cascade.provider.errors", "provider failures by provider"),
 			SessionsEnded:        counter("cascade.sessions.ended", "sessions ended by reason"),
 			SessionsActive:       active,
+			AdminConfigWrites:    counter("cascade.admin.config_writes", "admin runtime configuration writes by result"),
 		},
 	}
 }

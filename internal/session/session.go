@@ -25,12 +25,24 @@ import (
 // Options configures one Session. Session is deep-copied into an immutable
 // snapshot; Limits supplies every queue size and timeout.
 type Options struct {
-	ID       string
-	Session  config.SessionDefaults
-	Limits   config.Limits
-	ASR      provider.ASR
-	LLM      provider.LLM
-	TTS      provider.TTS
+	ID      string
+	Session config.SessionDefaults
+	Limits  config.Limits
+	ASR     provider.ASR
+	LLM     provider.LLM
+	TTS     provider.TTS
+	// ASRLanguage and ASRModel configure the ASR stream. They come from the
+	// profile, not from the protocol-visible transcription object.
+	ASRLanguage string
+	ASRModel    string
+	// Temperature is nil when the LLM provider's own default applies.
+	Temperature *float64
+	// Profile and the three instance names are labels only: they identify
+	// which runtime configuration served this session in spans and metrics.
+	Profile  string
+	ASRName  string
+	LLMName  string
+	TTSName  string
 	Logger   *slog.Logger
 	Recorder recorder.Recorder
 	// Telemetry is optional; nil records nothing.
@@ -59,6 +71,9 @@ type Session struct {
 	asr    provider.ASR
 	llm    provider.LLM
 	tts    provider.TTS
+	asrCfg provider.ASRConfig
+	temp   *float64
+	attrs  []attribute.KeyValue // profile / instance names, shared by span and metrics
 	log    *slog.Logger
 	rec    recorder.Recorder
 	tel    *observability.Telemetry
@@ -136,6 +151,7 @@ func New(opts Options) *Session {
 		asr:        opts.ASR,
 		llm:        opts.LLM,
 		tts:        opts.TTS,
+		temp:       opts.Temperature,
 		log:        log.With("session_id", opts.ID),
 		rec:        opts.Recorder,
 		tel:        tel,
@@ -147,15 +163,30 @@ func New(opts Options) *Session {
 		buffer:     newInputAudioBuffer(opts.Limits.InputAudioBufferMaxMs),
 		conv:       newConversation(),
 	}
+	s.asrCfg = provider.ASRConfig{
+		SampleRate: audio.SampleRate,
+		Language:   opts.ASRLanguage,
+		Model:      opts.ASRModel,
+	}
+	if tr := cfg.Audio.Input.Transcription; tr != nil {
+		s.asrCfg.Prompt = tr.Prompt
+	}
+	s.attrs = []attribute.KeyValue{
+		observability.KeyProfile.String(opts.Profile),
+		observability.KeyASR.String(opts.ASRName),
+		observability.KeyLLM.String(opts.LLMName),
+		observability.KeyTTS.String(opts.TTSName),
+	}
 	s.applyTurnDetection()
 	return s
 }
 
 // Start opens the ASR stream and launches the actor goroutine.
 func (s *Session) Start(ctx context.Context) error {
-	ctx, s.span = s.tel.Tracer.Start(ctx, "session", trace.WithAttributes(observability.KeySessionID.String(s.id)))
+	ctx, s.span = s.tel.Tracer.Start(ctx, "session",
+		trace.WithAttributes(append([]attribute.KeyValue{observability.KeySessionID.String(s.id)}, s.attrs...)...))
 	s.ctx, s.cancel = context.WithCancelCause(ctx)
-	stream, err := s.asr.OpenStream(s.ctx, s.asrConfig())
+	stream, err := s.asr.OpenStream(s.ctx, s.asrCfg)
 	if err != nil {
 		s.cancel(closeError{CloseProviderError})
 		s.tel.Metrics.ProviderErrors.Add(ctx, 1, metric.WithAttributes(observability.KeyProvider.String("asr")))
@@ -166,7 +197,7 @@ func (s *Session) Start(ctx context.Context) error {
 		close(s.done)
 		return fmt.Errorf("open asr stream: %w", err)
 	}
-	s.tel.Metrics.SessionsActive.Add(ctx, 1)
+	s.tel.Metrics.SessionsActive.Add(ctx, 1, metric.WithAttributes(s.attrs...))
 	s.asrStream = stream
 	s.asrEvents = stream.Events()
 	s.startedAt = time.Now()
@@ -395,8 +426,9 @@ func (s *Session) cleanup() {
 	}
 	close(s.events)
 	bg := context.Background()
-	s.tel.Metrics.SessionsActive.Add(bg, -1)
-	s.tel.Metrics.SessionsEnded.Add(bg, 1, metric.WithAttributes(observability.KeyReason.String(string(reason))))
+	s.tel.Metrics.SessionsActive.Add(bg, -1, metric.WithAttributes(s.attrs...))
+	s.tel.Metrics.SessionsEnded.Add(bg, 1,
+		metric.WithAttributes(append([]attribute.KeyValue{observability.KeyReason.String(string(reason))}, s.attrs...)...))
 	s.span.SetAttributes(observability.KeyReason.String(string(reason)), attribute.Int("cascade.items", s.conv.count()), attribute.Int("cascade.responses", s.responses))
 	s.span.End()
 	if s.rec != nil {
@@ -419,14 +451,6 @@ func (s *Session) stopTimers() {
 }
 
 // ---- configuration ---------------------------------------------------------
-
-func (s *Session) asrConfig() provider.ASRConfig {
-	cfg := provider.ASRConfig{SampleRate: audio.SampleRate}
-	if tr := s.cfg.Audio.Input.Transcription; tr != nil {
-		cfg.Language, cfg.Prompt, cfg.Model = tr.Language, tr.Prompt, tr.Model
-	}
-	return cfg
-}
 
 func (s *Session) ttsConfig(voice string) provider.TTSConfig {
 	return provider.TTSConfig{
@@ -951,6 +975,7 @@ func (s *Session) startPipeline(r *response) {
 			Instructions:    r.instructions,
 			Messages:        s.conv.messages(),
 			MaxOutputTokens: r.maxTokens,
+			Temperature:     s.temp,
 		},
 		ttsCfg: s.ttsConfig(r.voice),
 		llm:    s.llm, tts: s.tts, out: s.respEvents,

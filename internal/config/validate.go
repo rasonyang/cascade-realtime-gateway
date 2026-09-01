@@ -10,12 +10,17 @@ import (
 // imports the provider registry. A nil lookup skips the existence check.
 type ProviderLookup func(kind, typ string) bool
 
+// providerKinds are the three roles a provider instance can fill.
+var providerKinds = []string{"asr", "llm", "tts"}
+
 var logLevels = []string{"debug", "info", "warn", "error"}
 
 var eagernessValues = []string{"low", "medium", "high", "auto"}
 
-// Validate checks the whole configuration and returns the first problem as a
-// *FieldError naming the offending field.
+// Validate checks the whole static configuration and returns the first problem
+// as a *FieldError naming the offending field. Runtime configuration
+// (providers, profiles, settings) is validated by RuntimeConfig.Validate; the
+// optional bootstrap block is checked here so a bad seed fails at startup.
 func (c *Config) Validate(known ProviderLookup) error {
 	if strings.TrimSpace(c.Listen) == "" {
 		return fieldErrorf("listen", "must not be empty")
@@ -23,24 +28,25 @@ func (c *Config) Validate(known ProviderLookup) error {
 	if c.Auth.APIKey == "" {
 		return fieldErrorf("auth.api_key", "must not be empty")
 	}
-	for _, p := range []struct {
-		kind string
-		cfg  Provider
-	}{
-		{"asr", c.Providers.ASR},
-		{"llm", c.Providers.LLM},
-		{"tts", c.Providers.TTS},
-	} {
-		field := "providers." + p.kind + ".type"
-		if p.cfg.Type == "" {
-			return fieldErrorf(field, "must not be empty")
+	if c.Auth.AdminAPIKey != "" {
+		if c.Auth.AdminAPIKey == c.Auth.APIKey {
+			return fieldErrorf("auth.admin_api_key", "must differ from auth.api_key")
 		}
-		if known != nil && !known(p.kind, p.cfg.Type) {
-			return fieldErrorf(field, "unknown provider %q", p.cfg.Type)
+		if strings.TrimSpace(c.Admin.Listen) == "" {
+			return fieldErrorf("admin.listen", "must not be empty when auth.admin_api_key is set")
+		}
+		if strings.TrimSpace(c.Admin.StateFile) == "" {
+			return fieldErrorf("admin.state_file", "must not be empty when auth.admin_api_key is set")
 		}
 	}
-	if err := c.SessionDefaults.Validate("session_defaults"); err != nil {
-		return err
+	if len(c.Bootstrap) > 0 {
+		rc, err := DecodeRuntimeConfig(c.Bootstrap, "bootstrap")
+		if err != nil {
+			return err
+		}
+		if err := rc.validate("bootstrap.", known); err != nil {
+			return err
+		}
 	}
 	if err := c.Limits.validate("limits"); err != nil {
 		return err
@@ -52,12 +58,115 @@ func (c *Config) Validate(known ProviderLookup) error {
 	return nil
 }
 
+// Validate checks a whole runtime configuration: every provider instance, every
+// profile, the cross-references between them, and the settings. It returns the
+// first problem as a *FieldError with the resource's dotted field path.
+func (c *RuntimeConfig) Validate(known ProviderLookup) error { return c.validate("", known) }
+
+func (c *RuntimeConfig) validate(prefix string, known ProviderLookup) error {
+	for _, name := range c.ProviderNames() {
+		if err := c.Providers[name].validate(prefix+"providers."+name, name, known); err != nil {
+			return err
+		}
+	}
+	for _, name := range c.ProfileNames() {
+		p := c.Profiles[name]
+		field := prefix + "profiles." + name
+		if err := p.validate(field, name); err != nil {
+			return err
+		}
+		for _, ref := range []struct {
+			kind, instance string
+		}{{"asr", p.ASR}, {"llm", p.LLM}, {"tts", p.TTS}} {
+			if err := c.validateRef(field+"."+ref.kind, ref.kind, ref.instance, known); err != nil {
+				return err
+			}
+		}
+	}
+	if d := c.Settings.DefaultProfile; d != "" {
+		if _, ok := c.Profiles[d]; !ok {
+			return fieldErrorf(prefix+"settings.default_profile", "unknown profile %q", d)
+		}
+	}
+	return nil
+}
+
+// validateRef checks that a profile's provider reference exists and that the
+// referenced instance's type is registered for that role.
+func (c *RuntimeConfig) validateRef(field, kind, instance string, known ProviderLookup) error {
+	if instance == "" {
+		return fieldErrorf(field, "must not be empty")
+	}
+	inst, ok := c.Providers[instance]
+	if !ok {
+		return fieldErrorf(field, "unknown provider instance %q", instance)
+	}
+	if known != nil && !known(kind, inst.Type) {
+		return fieldErrorf(field, "provider %q does not support %s", inst.Type, kind)
+	}
+	return nil
+}
+
+func (p *ProviderInstance) validate(field, key string, known ProviderLookup) error {
+	if p.Name != key {
+		return fieldErrorf(field+".name", "must equal the resource name %q, got %q", key, p.Name)
+	}
+	if p.Type == "" {
+		return fieldErrorf(field+".type", "must not be empty")
+	}
+	if known != nil && !slices.ContainsFunc(providerKinds, func(k string) bool { return known(k, p.Type) }) {
+		return fieldErrorf(field+".type", "unknown provider type %q", p.Type)
+	}
+	if p.APIKey == "" {
+		return fieldErrorf(field+".api_key", "must not be empty")
+	}
+	return nil
+}
+
+func (p *Profile) validate(field, key string) error {
+	if p.Name != key {
+		return fieldErrorf(field+".name", "must equal the resource name %q, got %q", key, p.Name)
+	}
+	if err := validateModalities(field+".output_modalities", p.OutputModalities); err != nil {
+		return err
+	}
+	if err := validateMaxOutputTokens(field+".max_output_tokens", p.MaxOutputTokens); err != nil {
+		return err
+	}
+	if err := validateSpeed(field+".speed", p.Speed); err != nil {
+		return err
+	}
+	if p.Voice == "" {
+		return fieldErrorf(field+".voice", "must not be empty")
+	}
+	if t := p.Temperature; t != nil && (*t < TemperatureMin || *t > TemperatureMax) {
+		return fieldErrorf(field+".temperature", "must be within [%g, %g], got %g",
+			TemperatureMin, TemperatureMax, *t)
+	}
+	if t := p.Transcription; t != nil {
+		// asr_language / asr_model are the single source of truth; accepting
+		// them here too would leave two places to look.
+		if t.Language != "" {
+			return fieldErrorf(field+".transcription.language", "not configurable here; use %s.asr_language", field)
+		}
+		if t.Model != "" {
+			return fieldErrorf(field+".transcription.model", "not configurable here; use %s.asr_model", field)
+		}
+	}
+	if td := p.TurnDetection; td != nil {
+		if err := td.validate(field + ".turn_detection"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Validate checks a session object; prefix is prepended to field paths so the
-// same checks serve both the config file and protocol-level session updates.
+// same checks serve both a profile projection and protocol-level session
+// updates.
 func (s *SessionDefaults) Validate(prefix string) error {
-	mods := s.OutputModalities
-	if len(mods) != 1 || (mods[0] != ModalityAudio && mods[0] != ModalityText) {
-		return fieldErrorf(prefix+".output_modalities", `must be exactly ["audio"] or ["text"]`)
+	if err := validateModalities(prefix+".output_modalities", s.OutputModalities); err != nil {
+		return err
 	}
 	if err := s.Audio.Input.Format.validate(prefix + ".audio.input.format"); err != nil {
 		return err
@@ -70,11 +179,29 @@ func (s *SessionDefaults) Validate(prefix string) error {
 			return err
 		}
 	}
-	if sp := s.Audio.Output.Speed; sp < SpeedMin || sp > SpeedMax {
-		return fieldErrorf(prefix+".audio.output.speed", "must be within [%g, %g], got %g", SpeedMin, SpeedMax, sp)
+	if err := validateSpeed(prefix+".audio.output.speed", s.Audio.Output.Speed); err != nil {
+		return err
 	}
-	if !s.MaxOutputTokens.Inf && (s.MaxOutputTokens.N < 1 || s.MaxOutputTokens.N > MaxOutputTokensLimit) {
-		return fieldErrorf(prefix+".max_output_tokens", `must be "inf" or within [1, %d], got %d`, MaxOutputTokensLimit, s.MaxOutputTokens.N)
+	return validateMaxOutputTokens(prefix+".max_output_tokens", s.MaxOutputTokens)
+}
+
+func validateModalities(field string, mods []string) error {
+	if len(mods) != 1 || (mods[0] != ModalityAudio && mods[0] != ModalityText) {
+		return fieldErrorf(field, `must be exactly ["audio"] or ["text"]`)
+	}
+	return nil
+}
+
+func validateSpeed(field string, speed float64) error {
+	if speed < SpeedMin || speed > SpeedMax {
+		return fieldErrorf(field, "must be within [%g, %g], got %g", SpeedMin, SpeedMax, speed)
+	}
+	return nil
+}
+
+func validateMaxOutputTokens(field string, m MaxOutputTokens) error {
+	if !m.Inf && (m.N < 1 || m.N > MaxOutputTokensLimit) {
+		return fieldErrorf(field, `must be "inf" or within [1, %d], got %d`, MaxOutputTokensLimit, m.N)
 	}
 	return nil
 }

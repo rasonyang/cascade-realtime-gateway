@@ -13,6 +13,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/rasonyang/cascade-realtime-gateway/internal/admin"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/audio"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/config"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/provider"
@@ -22,32 +23,52 @@ import (
 
 const gatewayKey = "bench-key"
 
+// staticResolver serves one fixed runtime configuration: the bench drives the
+// gateway directly and has no Admin state file.
+type staticResolver struct{ rt admin.Runtime }
+
+func (s staticResolver) Resolve() (admin.Runtime, error) { return s.rt, nil }
+
 // benchE2E drives the real gateway over its own WebSocket protocol with the
 // qwen providers behind it, and measures a complete voice turn from the
 // client's point of view.
 func benchE2E(ctx context.Context, key string, pcm []byte, turns int, ttsOpts qwen.TTSOptions, cap *logCapture) (section, error) {
 	cfg := config.DefaultConfig()
 	cfg.Auth.APIKey = gatewayKey
-	opts := json.RawMessage(`{}`)
-	cfg.Providers.ASR = config.Provider{Type: "qwen", APIKey: key, Options: opts}
-	cfg.Providers.LLM = config.Provider{Type: "qwen", APIKey: key, Options: opts}
-	ttsRaw, err := json.Marshal(ttsOpts)
-	if err != nil {
-		return section{}, err
-	}
-	cfg.Providers.TTS = config.Provider{Type: "qwen", APIKey: key, Options: ttsRaw}
-	cfg.SessionDefaults.Instructions = "You are a concise voice assistant. Answer in two short sentences."
-	cfg.SessionDefaults.Audio.Output.Voice = "longanlingxi"
-	cfg.SessionDefaults.Audio.Input.TurnDetection.ApplyDefaults()
 	cfg.Limits.ASRFinalTimeout = config.Duration(5 * time.Second)
 	if err := cfg.Validate(provider.Known); err != nil {
 		return section{}, err
 	}
-	providers, err := server.Build(cfg)
+	ttsRaw, err := json.Marshal(ttsOpts)
 	if err != nil {
 		return section{}, err
 	}
-	srv := server.New(server.Options{Config: cfg, Providers: providers, Logger: slog.Default()})
+	prof := config.DefaultProfile()
+	prof.Name, prof.ASR, prof.LLM, prof.TTS = "bench", "qwen-asr", "qwen-llm", "qwen-tts"
+	prof.Instructions = "You are a concise voice assistant. Answer in two short sentences."
+	prof.Voice = "longanlingxi"
+	prof.TurnDetection.ApplyDefaults()
+
+	rt := admin.Runtime{
+		Profile: prof.Name, ASRName: prof.ASR, LLMName: prof.LLM, TTSName: prof.TTS,
+		Session: prof.SessionDefaults(), Temperature: prof.Temperature,
+	}
+	empty := json.RawMessage(`{}`)
+	asr, err := provider.New(provider.KindASR, "qwen", key, empty)
+	if err != nil {
+		return section{}, err
+	}
+	llm, err := provider.New(provider.KindLLM, "qwen", key, empty)
+	if err != nil {
+		return section{}, err
+	}
+	tts, err := provider.New(provider.KindTTS, "qwen", key, ttsRaw)
+	if err != nil {
+		return section{}, err
+	}
+	rt.ASR, rt.LLM, rt.TTS = asr.(provider.ASR), llm.(provider.LLM), tts.(provider.TTS)
+
+	srv := server.New(server.Options{Config: cfg, Resolver: staticResolver{rt}, Logger: slog.Default()})
 	http := httptest.NewServer(srv.Handler())
 	defer http.Close()
 	defer srv.Shutdown(context.Background())
@@ -69,7 +90,7 @@ func benchE2E(ctx context.Context, key string, pcm []byte, turns int, ttsOpts qw
 	speechToCommit := &series{Name: "speech end→commit (VAD hold)"}
 	toDone := &series{Name: "speech end→response.done"}
 
-	silenceMs := *cfg.SessionDefaults.Audio.Input.TurnDetection.SilenceDurationMs
+	silenceMs := *prof.TurnDetection.SilenceDurationMs
 	const playableMs = 100
 
 	events := make(chan stampedEvent, 256)

@@ -166,6 +166,9 @@ func TestProfileIgnoredFieldsEcho(t *testing.T) {
 func TestProfileAcceptedItemsAndOverrides(t *testing.T) {
 	r := newRig(t, defaultScripts(), "", manual)
 	r.send(`{"type":"conversation.item.create","item":{"id":"sys1","type":"message","role":"system","content":[{"type":"input_text","text":"Be kind."}],"status":"completed","object":"realtime.item"}}`)
+	// The adapter learns an item's id from the event the actor emits, so a
+	// create referencing sys1 must not be sent before that event arrives.
+	r.waitCount("conversation.item.added", 1)
 	r.send(`{"type":"conversation.item.create","item":{"id":"a1","type":"message","role":"assistant","content":[{"type":"text","text":"Earlier answer."}]}}`)
 	r.send(`{"type":"conversation.item.create","item":{"id":"u1","type":"message","role":"user","content":[{"type":"input_text","text":"Question?"}]},"previous_item_id":"sys1"}`)
 	r.send(`{"type":"conversation.item.create","item":{"id":"first","type":"message","role":"user","content":[{"type":"input_text","text":"Very first."}]},"previous_item_id":"root"}`)

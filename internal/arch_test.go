@@ -20,11 +20,12 @@ var forbidden = map[string][]string{
 	"config":        {"*"},
 	"observability": {"*"},
 	"audio":         {"*"},
-	"vad":           {"config", "observability", "provider", "session", "protocol", "server", "recorder"}, // may use audio only
-	"provider":      {"session", "protocol", "server"},
-	"session":       {"protocol", "server"},
-	"protocol":      {"server"},
-	"recorder":      {"protocol", "server"},
+	"vad":           {"config", "observability", "provider", "session", "protocol", "server", "recorder", "admin"}, // may use audio only
+	"provider":      {"session", "protocol", "server", "admin"},
+	"session":       {"protocol", "server", "admin"},
+	"protocol":      {"server", "admin"},
+	"recorder":      {"protocol", "server", "admin"},
+	"admin":         {"session", "protocol", "server"},
 }
 
 // TestImportDirection scans every non-test Go file under internal/ and fails

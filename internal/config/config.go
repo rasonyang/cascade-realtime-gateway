@@ -26,35 +26,39 @@ const (
 	MaxOutputTokensLimit = 4096
 )
 
-// Config is the complete Cascade configuration. It is an immutable snapshot
+// Config is the complete static Cascade configuration: everything that is
+// fixed for the lifetime of the process. Providers, profiles and settings are
+// runtime configuration owned by the Admin API (see RuntimeConfig) and appear
+// here only as the optional Bootstrap seed. Config is an immutable snapshot
 // after Load; nothing mutates it at runtime.
 type Config struct {
-	Listen          string          `json:"listen"`
-	Auth            Auth            `json:"auth"`
-	Providers       Providers       `json:"providers"`
-	SessionDefaults SessionDefaults `json:"session_defaults"`
-	Limits          Limits          `json:"limits"`
-	Observability   Observability   `json:"observability"`
+	Listen        string        `json:"listen"`
+	Auth          Auth          `json:"auth"`
+	Admin         Admin         `json:"admin"`
+	Limits        Limits        `json:"limits"`
+	Observability Observability `json:"observability"`
+	// Bootstrap seeds the runtime configuration the first time the gateway
+	// starts with no state file. It is kept raw so that {env.NAME}
+	// placeholders inside it are stored verbatim rather than expanded into
+	// the state file, and so that profile defaults are applied by the same
+	// decoder the Admin API uses.
+	Bootstrap json.RawMessage `json:"bootstrap,omitempty"`
 }
 
-// Auth holds the gateway's static Bearer token.
+// Auth holds the gateway's static Bearer tokens. APIKey guards
+// /v1/realtime; AdminAPIKey guards the Admin API and, when empty, disables
+// the Admin API entirely. The two must differ.
 type Auth struct {
-	APIKey string `json:"api_key"`
+	APIKey      string `json:"api_key"`
+	AdminAPIKey string `json:"admin_api_key"`
 }
 
-// Providers selects one provider per kind.
-type Providers struct {
-	ASR Provider `json:"asr"`
-	LLM Provider `json:"llm"`
-	TTS Provider `json:"tts"`
-}
-
-// Provider names a provider implementation and carries its opaque options,
-// which are parsed only inside the provider's own package.
-type Provider struct {
-	Type    string          `json:"type"`
-	APIKey  string          `json:"api_key"`
-	Options json.RawMessage `json:"options"`
+// Admin configures the Admin API listener and its state file. Bind Listen to
+// localhost or a private network: the Admin API changes what every new call
+// runs on.
+type Admin struct {
+	Listen    string `json:"listen"`
+	StateFile string `json:"state_file"`
 }
 
 // SessionDefaults is a subset of the GA session object. Field names and JSON
@@ -158,26 +162,9 @@ const (
 func DefaultConfig() *Config {
 	return &Config{
 		Listen: ":8080",
-		SessionDefaults: SessionDefaults{
-			Instructions:     "You are a helpful assistant.",
-			OutputModalities: []string{ModalityAudio},
-			Audio: Audio{
-				Input: AudioInput{
-					Format:        AudioFormat{Type: AudioFormatPCM, Rate: AudioSampleRate},
-					Transcription: &Transcription{},
-					TurnDetection: &TurnDetection{
-						Type:              TurnDetectionServerVAD,
-						CreateResponse:    true,
-						InterruptResponse: true,
-					},
-				},
-				Output: AudioOutput{
-					Format: AudioFormat{Type: AudioFormatPCM, Rate: AudioSampleRate},
-					Voice:  "alloy",
-					Speed:  1.0,
-				},
-			},
-			MaxOutputTokens: MaxOutputTokens{Inf: true},
+		Admin: Admin{
+			Listen:    "127.0.0.1:8081",
+			StateFile: "cascade-state.json",
 		},
 		Limits: Limits{
 			MaxSessions:           100,

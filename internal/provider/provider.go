@@ -112,11 +112,14 @@ type Message struct {
 	Content string
 }
 
-// ChatRequest is a single, request-scoped generation.
+// ChatRequest is a single, request-scoped generation. Temperature is nil when
+// the caller wants the provider's own default; 0 is a meaningful value, so the
+// field is a pointer rather than a sentinel.
 type ChatRequest struct {
 	Instructions    string
 	Messages        []Message
 	MaxOutputTokens int // 0 means no limit
+	Temperature     *float64
 }
 
 // FinishReason mirrors the OpenAI finish reasons Cascade maps.

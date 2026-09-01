@@ -366,7 +366,7 @@ func TestInputQueueOverflowClosesSession(t *testing.T) {
 	// Fill the outbound queue so the actor blocks in emit, then overflow the
 	// bounded audio queue from the "read loop".
 	def := config.DefaultConfig()
-	opts := Options{ID: "q", Session: def.SessionDefaults, Limits: def.Limits}
+	opts := Options{ID: "q", Session: config.DefaultProfile().SessionDefaults(), Limits: def.Limits}
 	opts.Session.Audio.Input.TurnDetection = nil
 	opts.Limits.OutputEventQueue = 1
 	opts.Limits.InputAudioQueueFrames = 2
@@ -662,7 +662,7 @@ func TestCleanupReclaimsGoroutines(t *testing.T) {
 			sc.llm.Block, sc.llm.BlockAfter = true, 1 // close mid-generation
 		}
 		def := config.DefaultConfig()
-		opts := Options{ID: "g", Session: def.SessionDefaults, Limits: def.Limits}
+		opts := Options{ID: "g", Session: config.DefaultProfile().SessionDefaults(), Limits: def.Limits}
 		opts.Session.Audio.Input.TurnDetection = nil
 		opts.Limits.ClientWriteTimeout = config.Duration(100 * time.Millisecond)
 		opts.ASR, opts.LLM, opts.TTS = mock.NewASR(sc.asr), mock.NewLLM(sc.llm), mock.NewTTS(sc.tts)

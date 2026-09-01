@@ -2,3 +2,4 @@
 *.local.json
 .env
 .DS_Store
+/cascade-state.json

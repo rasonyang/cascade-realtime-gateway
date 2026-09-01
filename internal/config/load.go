@@ -16,9 +16,10 @@ var envPlaceholder = regexp.MustCompile(`\{env\.([A-Za-z_][A-Za-z0-9_]*)\}`)
 
 // Load reads the configuration file at path and returns a complete Config:
 // the file is decoded strictly (unknown fields are errors) on top of
-// DefaultConfig, {env.NAME} placeholders are expanded with an error that
-// names the field path when a variable is unset, and mode-specific
-// turn_detection defaults are filled in. Load does not call Validate.
+// DefaultConfig and {env.NAME} placeholders are expanded with an error that
+// names the field path when a variable is unset. The `bootstrap` block is
+// exempt from expansion: it is runtime configuration that the Admin state
+// file must keep verbatim. Load does not call Validate.
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -70,11 +71,24 @@ func Parse(raw []byte, lookupEnv func(string) (string, bool)) (*Config, error) {
 	if err := strict.Decode(cfg); err != nil {
 		return nil, decodeError(err, expanded)
 	}
-
-	if td := cfg.SessionDefaults.Audio.Input.TurnDetection; td != nil {
-		td.ApplyDefaults()
-	}
 	return cfg, nil
+}
+
+// bootstrapKey is the one top-level block env expansion skips.
+const bootstrapKey = "bootstrap"
+
+// ExpandEnv expands {env.NAME} placeholders in a single string. field names
+// the value in the returned *FieldError when a variable is unset. A nil
+// lookup treats every variable as unset.
+func ExpandEnv(field, s string, lookupEnv func(string) (string, bool)) (string, error) {
+	if lookupEnv == nil {
+		lookupEnv = func(string) (string, bool) { return "", false }
+	}
+	out, err := expandEnv(s, field, lookupEnv)
+	if err != nil {
+		return "", err
+	}
+	return out.(string), nil
 }
 
 func ensureEOF(dec *json.Decoder) error {
@@ -91,6 +105,12 @@ func expandEnv(node any, path string, lookupEnv func(string) (string, bool)) (an
 	case map[string]any:
 		out := make(map[string]any, len(v))
 		for k, child := range v {
+			if path == "" && k == bootstrapKey {
+				// Runtime configuration is stored verbatim so the Admin state
+				// file keeps {env.NAME} rather than the resolved secret.
+				out[k] = child
+				continue
+			}
 			expandedChild, err := expandEnv(child, joinPath(path, k), lookupEnv)
 			if err != nil {
 				return nil, err

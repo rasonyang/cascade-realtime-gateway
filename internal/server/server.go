@@ -3,7 +3,7 @@
 // session, a single writer goroutine per connection, timeout disconnects,
 // the concurrent-session limit and graceful shutdown.
 //
-// Layering: server imports protocol, session, config, provider, recorder.
+// Layering: server imports protocol, session, config, admin, recorder.
 // Nothing imports server.
 package server
 
@@ -20,25 +20,25 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/rasonyang/cascade-realtime-gateway/internal/admin"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/config"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/observability"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/protocol"
-	"github.com/rasonyang/cascade-realtime-gateway/internal/provider"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/recorder"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/session"
 )
 
-// Providers are the three provider instances shared by every session.
-type Providers struct {
-	ASR provider.ASR
-	LLM provider.LLM
-	TTS provider.TTS
+// Resolver hands the server the runtime configuration one new connection runs
+// with. *admin.Store implements it; the snapshot is taken once per connection,
+// so an Admin write affects only later connections.
+type Resolver interface {
+	Resolve() (admin.Runtime, error)
 }
 
 // Options configures a Server.
 type Options struct {
 	Config    *config.Config
-	Providers Providers
+	Resolver  Resolver
 	Logger    *slog.Logger
 	Recorder  recorder.Recorder
 	Telemetry *observability.Telemetry // nil records nothing
@@ -47,11 +47,11 @@ type Options struct {
 // Server owns the connection lifecycle. Its root context is cancelled by
 // Shutdown, which ends every session.
 type Server struct {
-	cfg  *config.Config
-	prov Providers
-	log  *slog.Logger
-	rec  recorder.Recorder
-	tel  *observability.Telemetry
+	cfg *config.Config
+	res Resolver
+	log *slog.Logger
+	rec recorder.Recorder
+	tel *observability.Telemetry
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -72,7 +72,7 @@ func New(opts Options) *Server {
 		log = slog.Default()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Server{cfg: opts.Config, prov: opts.Providers, log: log, rec: opts.Recorder, tel: opts.Telemetry, ctx: ctx, cancel: cancel}
+	return &Server{cfg: opts.Config, res: opts.Resolver, log: log, rec: opts.Recorder, tel: opts.Telemetry, ctx: ctx, cancel: cancel}
 }
 
 // Handler returns the HTTP handler serving RealtimePath.
@@ -141,6 +141,19 @@ func (s *Server) handleRealtime(w http.ResponseWriter, r *http.Request) {
 		writeHTTPError(w, http.StatusServiceUnavailable, "server_error", "The gateway is shutting down.")
 		return
 	}
+	// The runtime configuration is resolved before the upgrade so a gateway
+	// with no usable profile answers with an HTTP status, not a close frame.
+	rt, err := s.res.Resolve()
+	if err != nil {
+		if errors.Is(err, admin.ErrNoDefaultProfile) {
+			writeHTTPError(w, http.StatusServiceUnavailable, "server_error",
+				"No default profile is configured; set settings.default_profile through the Admin API.")
+			return
+		}
+		s.log.Error("runtime configuration unusable", "err", err)
+		writeHTTPError(w, http.StatusServiceUnavailable, "server_error", "The runtime configuration is unusable.")
+		return
+	}
 	// Reserve a slot before upgrading so the limit is never exceeded.
 	if n := s.active.Add(1); n > int64(s.cfg.Limits.MaxSessions) {
 		s.active.Add(-1)
@@ -162,7 +175,7 @@ func (s *Server) handleRealtime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	conn.SetReadLimit(int64(s.cfg.Limits.ClientMaxMessageBytes))
-	s.serve(conn, r.URL.Query().Get("model"))
+	s.serve(conn, r.URL.Query().Get("model"), rt)
 }
 
 // outMsg is either a frame to write or the final close.
@@ -173,7 +186,7 @@ type outMsg struct {
 	reason string
 }
 
-func (s *Server) serve(conn *websocket.Conn, model string) {
+func (s *Server) serve(conn *websocket.Conn, model string, rt admin.Runtime) {
 	ctx, cancel := context.WithTimeout(s.ctx, s.cfg.Limits.SessionTimeout.Std())
 	defer cancel()
 	defer conn.CloseNow() //nolint:errcheck // last resort after the writer's Close
@@ -181,16 +194,19 @@ func (s *Server) serve(conn *websocket.Conn, model string) {
 	id := protocol.NewSessionID()
 	log := s.log.With("session_id", id)
 	sess := session.New(session.Options{
-		ID: id, Session: s.cfg.SessionDefaults, Limits: s.cfg.Limits,
-		ASR: s.prov.ASR, LLM: s.prov.LLM, TTS: s.prov.TTS, Logger: s.log, Recorder: s.rec, Telemetry: s.tel,
+		ID: id, Session: rt.Session, Limits: s.cfg.Limits,
+		ASR: rt.ASR, LLM: rt.LLM, TTS: rt.TTS,
+		ASRLanguage: rt.ASRLanguage, ASRModel: rt.ASRModel, Temperature: rt.Temperature,
+		Profile: rt.Profile, ASRName: rt.ASRName, LLMName: rt.LLMName, TTSName: rt.TTSName,
+		Logger: s.log, Recorder: s.rec, Telemetry: s.tel,
 	})
 	if err := sess.Start(ctx); err != nil {
 		log.Error("session start failed", "err", err)
 		_ = conn.Close(websocket.StatusInternalError, string(session.CloseProviderError))
 		return
 	}
-	adapter := protocol.New(protocol.Options{SessionID: id, Model: model, Defaults: s.cfg.SessionDefaults, Session: sess})
-	log.Info("connection opened", "model", model, "active", s.active.Load())
+	adapter := protocol.New(protocol.Options{SessionID: id, Model: model, Defaults: rt.Session, Session: sess})
+	log.Info("connection opened", "model", model, "profile", rt.Profile, "active", s.active.Load())
 
 	// The read loop uses its own context: cancelling the session context
 	// must not tear the socket down before the writer has sent the close
@@ -285,35 +301,4 @@ func (s *Server) serve(conn *websocket.Conn, model string) {
 	<-pumpDone
 	<-writerDone
 	log.Info("connection closed", "active", s.active.Load()-1)
-}
-
-// Build constructs the three providers named in cfg from the registry.
-func Build(cfg *config.Config) (Providers, error) {
-	var p Providers
-	mk := func(kind provider.Kind, pc config.Provider) (provider.Provider, error) {
-		return provider.New(kind, pc.Type, pc.APIKey, pc.Options)
-	}
-	asr, err := mk(provider.KindASR, cfg.Providers.ASR)
-	if err != nil {
-		return p, err
-	}
-	llm, err := mk(provider.KindLLM, cfg.Providers.LLM)
-	if err != nil {
-		return p, err
-	}
-	tts, err := mk(provider.KindTTS, cfg.Providers.TTS)
-	if err != nil {
-		return p, err
-	}
-	var ok bool
-	if p.ASR, ok = asr.(provider.ASR); !ok {
-		return p, errors.New("asr provider does not implement provider.ASR")
-	}
-	if p.LLM, ok = llm.(provider.LLM); !ok {
-		return p, errors.New("llm provider does not implement provider.LLM")
-	}
-	if p.TTS, ok = tts.(provider.TTS); !ok {
-		return p, errors.New("tts provider does not implement provider.TTS")
-	}
-	return p, nil
 }

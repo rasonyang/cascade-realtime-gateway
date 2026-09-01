@@ -97,6 +97,7 @@ type chatRequest struct {
 	StreamOptions  streamOptions `json:"stream_options"`
 	MaxTokens      int           `json:"max_tokens,omitempty"`
 	EnableThinking bool          `json:"enable_thinking"`
+	Temperature    *float64      `json:"temperature,omitempty"`
 }
 
 type streamOptions struct {
@@ -127,6 +128,7 @@ func (l *LLM) Chat(ctx context.Context, req provider.ChatRequest) (<-chan provid
 		StreamOptions:  streamOptions{IncludeUsage: true},
 		MaxTokens:      req.MaxOutputTokens,
 		EnableThinking: false,
+		Temperature:    req.Temperature,
 	}
 	if req.Instructions != "" {
 		body.Messages = append(body.Messages, chatMessage{Role: "system", Content: req.Instructions})

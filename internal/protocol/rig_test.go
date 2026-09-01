@@ -77,7 +77,7 @@ type rig struct {
 func newRig(t *testing.T, sc scripts, model string, tweak func(*session.Options)) *rig {
 	t.Helper()
 	def := config.DefaultConfig()
-	opts := session.Options{ID: "sess_test", Session: def.SessionDefaults, Limits: def.Limits}
+	opts := session.Options{ID: "sess_test", Session: config.DefaultProfile().SessionDefaults(), Limits: def.Limits}
 	opts.Limits.ASRFinalTimeout = config.Duration(time.Second)
 	opts.Limits.ClientWriteTimeout = config.Duration(200 * time.Millisecond)
 	if tweak != nil {

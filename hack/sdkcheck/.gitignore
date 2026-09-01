@@ -4,3 +4,4 @@ node_modules/
 cascade
 tlsproxy-bin
 config.otel.json
+sdkcheck-state.json

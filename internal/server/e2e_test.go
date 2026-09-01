@@ -22,6 +22,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
+	"github.com/rasonyang/cascade-realtime-gateway/internal/admin"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/audio"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/config"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/observability"
@@ -152,37 +153,50 @@ func TestE2EVoiceTurnAndInterrupt(t *testing.T) {
 
 	cfg := config.DefaultConfig()
 	cfg.Auth.APIKey = apiKey
-	cfg.Providers.ASR = config.Provider{Type: "deepgram", APIKey: dgKey, Options: json.RawMessage(`{"model":"nova-3","smart_format":true}`)}
+	cfg.Limits.ASRFinalTimeout = config.Duration(5 * time.Second)
+	if err := cfg.Validate(provider.Known); err != nil {
+		t.Fatal(err)
+	}
 	llmModel := os.Getenv("CASCADE_E2E_LLM_MODEL")
 	if llmModel == "" {
 		llmModel = "gpt-4o-mini"
 	}
 	t.Logf("llm model: %s (override with CASCADE_E2E_LLM_MODEL)", llmModel)
-	cfg.Providers.LLM = config.Provider{Type: "openai", APIKey: oaKey, Options: json.RawMessage(fmt.Sprintf(`{"model":%q}`, llmModel))}
 	ttsModel := os.Getenv("CASCADE_E2E_TTS_MODEL")
 	if ttsModel == "" {
 		ttsModel = "tts-1"
 	}
-	cfg.Providers.TTS = config.Provider{Type: "openai", APIKey: oaKey, Options: json.RawMessage(fmt.Sprintf(`{"model":%q}`, ttsModel))}
-	cfg.SessionDefaults.Instructions = "You are a concise voice assistant. Answer in one short sentence."
-	cfg.Limits.ASRFinalTimeout = config.Duration(5 * time.Second)
-	cfg.SessionDefaults.Audio.Input.TurnDetection.ApplyDefaults() // DefaultConfig leaves tuning fields to Load
+	prof := config.DefaultProfile()
+	prof.Name, prof.ASR, prof.LLM, prof.TTS = "e2e", "deepgram-asr", "openai-llm", "openai-tts"
+	prof.Instructions = "You are a concise voice assistant. Answer in one short sentence."
+	prof.TurnDetection.ApplyDefaults() // DefaultProfile leaves tuning fields to the decoder
 	// Synthesized speech pauses between sentences; a wider silence window
 	// keeps one utterance in one turn (OpenAI's server VAD would split too).
 	sil := 800
-	cfg.SessionDefaults.Audio.Input.TurnDetection.SilenceDurationMs = &sil
-	if err := cfg.Validate(provider.Known); err != nil {
-		t.Fatal(err)
+	prof.TurnDetection.SilenceDurationMs = &sil
+
+	rt := admin.Runtime{
+		Profile: prof.Name, ASRName: prof.ASR, LLMName: prof.LLM, TTSName: prof.TTS,
+		Session: prof.SessionDefaults(), Temperature: prof.Temperature,
 	}
-	providers, err := Build(cfg)
+	asr, err := provider.New(provider.KindASR, "deepgram", dgKey, json.RawMessage(`{"model":"nova-3","smart_format":true}`))
 	if err != nil {
 		t.Fatal(err)
 	}
+	llm, err := provider.New(provider.KindLLM, "openai", oaKey, json.RawMessage(fmt.Sprintf(`{"model":%q}`, llmModel)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tts, err := provider.New(provider.KindTTS, "openai", oaKey, json.RawMessage(fmt.Sprintf(`{"model":%q}`, ttsModel)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt.ASR, rt.LLM, rt.TTS = asr.(provider.ASR), llm.(provider.LLM), tts.(provider.TTS)
 	// In-memory telemetry so the run can be profiled from the Phase 5 metrics.
 	spanExp := tracetest.NewInMemoryExporter()
 	reader := sdkmetric.NewManualReader()
 	tel := observability.New(sdktrace.NewTracerProvider(sdktrace.WithSyncer(spanExp)), sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
-	srv := New(Options{Config: cfg, Providers: providers, Logger: slog.New(capture), Telemetry: tel})
+	srv := New(Options{Config: cfg, Resolver: stubResolver{rt}, Logger: slog.New(capture), Telemetry: tel})
 	f := &fixture{t: t, srv: srv, http: nil}
 	f.http = newHTTPServer(srv)
 	defer f.http.Close()

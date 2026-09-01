@@ -46,7 +46,7 @@ func newHarness(t *testing.T, sc scripts, tweak func(*Options)) *harness {
 	def := config.DefaultConfig()
 	opts := Options{
 		ID:      "test",
-		Session: def.SessionDefaults,
+		Session: config.DefaultProfile().SessionDefaults(),
 		Limits:  def.Limits,
 	}
 	opts.Limits.ASRFinalTimeout = config.Duration(time.Second)

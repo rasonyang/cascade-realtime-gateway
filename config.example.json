@@ -1,26 +1,12 @@
 {
   "listen": ":8080",
-  "auth": { "api_key": "{env.REALTIME_API_KEY}" },
-  "providers": {
-    "asr": { "type": "deepgram", "api_key": "{env.DEEPGRAM_API_KEY}", "options": { "model": "nova-3" } },
-    "llm": { "type": "openai",   "api_key": "{env.OPENAI_API_KEY}",   "options": { "model": "gpt-4o-mini", "base_url": "https://api.openai.com/v1" } },
-    "tts": { "type": "openai",   "api_key": "{env.OPENAI_API_KEY}",   "options": { "model": "tts-1" } }
+  "auth": {
+    "api_key": "{env.REALTIME_API_KEY}",
+    "admin_api_key": "{env.ADMIN_API_KEY}"
   },
-  "session_defaults": {
-    "instructions": "You are a helpful assistant.",
-    "output_modalities": ["audio"],
-    "audio": {
-      "input": {
-        "format": { "type": "audio/pcm", "rate": 24000 },
-        "transcription": {},
-        "turn_detection": {
-          "type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 500,
-          "create_response": true, "interrupt_response": true
-        }
-      },
-      "output": { "format": { "type": "audio/pcm", "rate": 24000 }, "voice": "alloy", "speed": 1.0 }
-    },
-    "max_output_tokens": "inf"
+  "admin": {
+    "listen": "127.0.0.1:8081",
+    "state_file": "cascade-state.json"
   },
   "limits": {
     "max_sessions": 100,
@@ -32,5 +18,67 @@
     "client_write_timeout": "10s",
     "client_max_message_bytes": 16777216
   },
-  "observability": { "log_level": "info", "otel_endpoint": "" }
+  "observability": {
+    "log_level": "info",
+    "otel_endpoint": ""
+  },
+  "bootstrap": {
+    "providers": {
+      "deepgram-asr": {
+        "name": "deepgram-asr",
+        "type": "deepgram",
+        "api_key": "{env.DEEPGRAM_API_KEY}",
+        "options": {
+          "model": "nova-3",
+          "smart_format": true
+        }
+      },
+      "openai-llm": {
+        "name": "openai-llm",
+        "type": "openai",
+        "api_key": "{env.OPENAI_API_KEY}",
+        "options": {
+          "model": "gpt-4o-mini",
+          "base_url": "https://api.openai.com/v1"
+        }
+      },
+      "openai-tts": {
+        "name": "openai-tts",
+        "type": "openai",
+        "api_key": "{env.OPENAI_API_KEY}",
+        "options": {
+          "model": "tts-1"
+        }
+      }
+    },
+    "profiles": {
+      "default": {
+        "name": "default",
+        "asr": "deepgram-asr",
+        "llm": "openai-llm",
+        "tts": "openai-tts",
+        "instructions": "You are a concise voice assistant.",
+        "max_output_tokens": "inf",
+        "output_modalities": [
+          "audio"
+        ],
+        "voice": "alloy",
+        "speed": 1.0,
+        "asr_language": "",
+        "asr_model": "",
+        "transcription": {},
+        "turn_detection": {
+          "type": "server_vad",
+          "threshold": 0.5,
+          "prefix_padding_ms": 300,
+          "silence_duration_ms": 500,
+          "create_response": true,
+          "interrupt_response": true
+        }
+      }
+    },
+    "settings": {
+      "default_profile": "default"
+    }
+  }
 }

@@ -74,6 +74,7 @@ type chatRequest struct {
 	StreamOptions       streamOptions `json:"stream_options"`
 	MaxCompletionTokens int           `json:"max_completion_tokens,omitempty"`
 	ReasoningEffort     string        `json:"reasoning_effort,omitempty"`
+	Temperature         *float64      `json:"temperature,omitempty"`
 }
 
 type streamOptions struct {
@@ -97,7 +98,8 @@ type chatChunk struct {
 // issued; the stream is consumed by a goroutine that exits on ctx.Done.
 func (l *LLM) Chat(ctx context.Context, req provider.ChatRequest) (<-chan provider.LLMChunk, error) {
 	body := chatRequest{Model: l.opts.Model, Stream: true, StreamOptions: streamOptions{IncludeUsage: true},
-		MaxCompletionTokens: req.MaxOutputTokens, ReasoningEffort: l.opts.ReasoningEffort}
+		MaxCompletionTokens: req.MaxOutputTokens, ReasoningEffort: l.opts.ReasoningEffort,
+		Temperature: req.Temperature}
 	if req.Instructions != "" {
 		body.Messages = append(body.Messages, chatMessage{Role: "system", Content: req.Instructions})
 	}
