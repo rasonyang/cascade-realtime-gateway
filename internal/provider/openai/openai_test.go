@@ -325,3 +325,318 @@ func TestRegistered(t *testing.T) {
 		t.Fatal("bad options must fail")
 	}
 }
+
+// ---- tool calls ------------------------------------------------------------
+
+// toolFragment renders one delta.tool_calls fragment; id and name are sent
+// only on a call's first fragment.
+func toolFragment(index int, id, name, args string) string {
+	call := map[string]any{"index": index, "function": map[string]any{"arguments": args}}
+	if id != "" {
+		call["id"] = id
+		call["type"] = "function"
+	}
+	if name != "" {
+		call["function"].(map[string]any)["name"] = name
+	}
+	b, _ := json.Marshal(map[string]any{
+		"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{call}}}},
+	})
+	return string(b)
+}
+
+const toolFinish = `{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`
+
+// chatServer streams the given SSE payloads and records the request body.
+func chatServer(t *testing.T, body *chatRequest, raw *map[string]any, lines ...string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf, _ := io.ReadAll(r.Body)
+		if body != nil {
+			json.Unmarshal(buf, body)
+		}
+		if raw != nil {
+			json.Unmarshal(buf, raw)
+		}
+		sse(w, lines...)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func toolCallsOf(chunks []provider.LLMChunk) []provider.ToolCall {
+	var out []provider.ToolCall
+	for _, c := range chunks {
+		if c.Kind == provider.LLMToolCall {
+			out = append(out, c.ToolCall)
+		}
+	}
+	return out
+}
+
+// TestLLMToolCallFragmentAccumulation: arguments split across fragments are
+// reassembled inside the adapter and surfaced as one complete call, before
+// Done.
+func TestLLMToolCallFragmentAccumulation(t *testing.T) {
+	srv := chatServer(t, nil, nil,
+		toolFragment(0, "call_abc", "transfer_to_agent", `{"depart`),
+		toolFragment(0, "", "", `ment":"sa`),
+		toolFragment(0, "", "", `les"}`),
+		toolFinish, `[DONE]`)
+	llm := NewLLM("sk-x", LLMOptions{httpOptions: opts(srv.URL), Model: "gpt-test"})
+	ch, err := llm.Chat(context.Background(), provider.ChatRequest{Tools: []provider.ToolDef{{Name: "transfer_to_agent"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := drain(t, ch)
+	if len(got) != 2 || got[0].Kind != provider.LLMToolCall || got[1].Kind != provider.LLMDone {
+		t.Fatalf("chunks = %+v, want the call then done", got)
+	}
+	want := provider.ToolCall{ID: "call_abc", Name: "transfer_to_agent", Arguments: `{"department":"sales"}`}
+	if got[0].ToolCall != want {
+		t.Errorf("call = %+v, want %+v", got[0].ToolCall, want)
+	}
+	if got[1].FinishReason != provider.FinishStop {
+		t.Errorf("finish reason = %q, want stop: a tool call is a completed turn", got[1].FinishReason)
+	}
+}
+
+// TestLLMToolCallWithText: a spoken preamble and a call in one generation.
+func TestLLMToolCallWithText(t *testing.T) {
+	srv := chatServer(t, nil, nil,
+		`{"choices":[{"index":0,"delta":{"content":"Let me check. "}}]}`,
+		toolFragment(0, "call_1", "take_message", `{}`),
+		toolFinish, `[DONE]`)
+	llm := NewLLM("sk-x", LLMOptions{httpOptions: opts(srv.URL)})
+	ch, err := llm.Chat(context.Background(), provider.ChatRequest{Tools: []provider.ToolDef{{Name: "take_message"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := drain(t, ch)
+	if len(got) != 3 || got[0].Kind != provider.LLMTextDelta || got[1].Kind != provider.LLMToolCall || got[2].Kind != provider.LLMDone {
+		t.Fatalf("chunks = %+v, want text, call, done", got)
+	}
+}
+
+// TestLLMToolCallCancelledMidArguments: a partial call never reaches the
+// session (docs/protocol-profile.md §6).
+func TestLLMToolCallCancelledMidArguments(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		f := w.(http.Flusher)
+		fmt.Fprintf(w, "data: %s\n\n", toolFragment(0, "call_abc", "hangup", `{"reas`))
+		f.Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+	ctx, cancel := context.WithCancel(context.Background())
+	llm := NewLLM("sk-x", LLMOptions{httpOptions: opts(srv.URL)})
+	ch, err := llm.Chat(ctx, provider.ChatRequest{Tools: []provider.ToolDef{{Name: "hangup"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	if calls := toolCallsOf(drain(t, ch)); len(calls) != 0 {
+		t.Fatalf("tool calls = %+v, want none after a mid-arguments cancel", calls)
+	}
+}
+
+// TestLLMToolCallTruncatedArguments: max_output_tokens mid-arguments leaves
+// the arguments unusable, so no call is delivered.
+func TestLLMToolCallTruncatedArguments(t *testing.T) {
+	srv := chatServer(t, nil, nil,
+		toolFragment(0, "call_abc", "hangup", `{"reas`),
+		`{"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}`,
+		`[DONE]`)
+	llm := NewLLM("sk-x", LLMOptions{httpOptions: opts(srv.URL)})
+	ch, err := llm.Chat(context.Background(), provider.ChatRequest{Tools: []provider.ToolDef{{Name: "hangup"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := drain(t, ch)
+	if len(got) != 1 || got[0].Kind != provider.LLMDone || got[0].FinishReason != provider.FinishLength {
+		t.Fatalf("chunks = %+v, want done/length with no call", got)
+	}
+}
+
+// TestLLMMultipleToolCallsAreAnError: more than one call is reported, never
+// silently dropped.
+func TestLLMMultipleToolCallsAreAnError(t *testing.T) {
+	srv := chatServer(t, nil, nil,
+		toolFragment(0, "call_1", "hangup", `{}`),
+		toolFragment(1, "call_2", "take_message", `{}`),
+		toolFinish, `[DONE]`)
+	llm := NewLLM("sk-x", LLMOptions{httpOptions: opts(srv.URL)})
+	ch, err := llm.Chat(context.Background(), provider.ChatRequest{
+		Tools: []provider.ToolDef{{Name: "hangup"}, {Name: "take_message"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := drain(t, ch)
+	if len(got) != 2 || got[0].Kind != provider.LLMToolCall || got[0].ToolCall.ID != "call_1" {
+		t.Fatalf("chunks = %+v, want the first call then an error", got)
+	}
+	var perr *provider.Error
+	if got[1].Kind != provider.LLMError || !errors.As(got[1].Err, &perr) {
+		t.Fatalf("second chunk = %+v, want a provider.Error", got[1])
+	}
+}
+
+// TestLLMToolsSerialization: the nested Chat Completions shape, an explicit
+// tool_choice and parallel_tool_calls:false.
+func TestLLMToolsSerialization(t *testing.T) {
+	var raw map[string]any
+	srv := chatServer(t, nil, &raw, `[DONE]`)
+	llm := NewLLM("sk-x", LLMOptions{httpOptions: opts(srv.URL)})
+	ch, err := llm.Chat(context.Background(), provider.ChatRequest{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}},
+		Tools: []provider.ToolDef{{
+			Name: "hangup", Description: "end the call",
+			Parameters: json.RawMessage(`{"type":"object","properties":{}}`),
+		}},
+		ToolChoice: provider.ToolChoice{Mode: provider.ToolChoiceAuto},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain(t, ch)
+	if raw["tool_choice"] != "auto" {
+		t.Errorf("tool_choice = %v", raw["tool_choice"])
+	}
+	if raw["parallel_tool_calls"] != false {
+		t.Errorf("parallel_tool_calls = %v, want false", raw["parallel_tool_calls"])
+	}
+	tools, _ := raw["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("tools = %v", raw["tools"])
+	}
+	tool := tools[0].(map[string]any)
+	fn, _ := tool["function"].(map[string]any)
+	if tool["type"] != "function" || fn["name"] != "hangup" || fn["description"] != "end the call" {
+		t.Errorf("tools[0] = %v", tool)
+	}
+	if params, _ := fn["parameters"].(map[string]any); params["type"] != "object" {
+		t.Errorf("parameters = %v, want the schema passed through verbatim", fn["parameters"])
+	}
+}
+
+// TestLLMForcedToolChoice: the object form of tool_choice.
+func TestLLMForcedToolChoice(t *testing.T) {
+	var raw map[string]any
+	srv := chatServer(t, nil, &raw, `[DONE]`)
+	llm := NewLLM("sk-x", LLMOptions{httpOptions: opts(srv.URL)})
+	ch, err := llm.Chat(context.Background(), provider.ChatRequest{
+		Tools:      []provider.ToolDef{{Name: "hangup"}},
+		ToolChoice: provider.ToolChoice{Mode: provider.ToolChoiceFunction, Name: "hangup"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain(t, ch)
+	choice, _ := raw["tool_choice"].(map[string]any)
+	fn, _ := choice["function"].(map[string]any)
+	if choice["type"] != "function" || fn["name"] != "hangup" {
+		t.Fatalf("tool_choice = %v", raw["tool_choice"])
+	}
+}
+
+// TestLLMNoToolFieldsWithoutTools: the API rejects tool_choice and
+// parallel_tool_calls on a request that declares no tools.
+func TestLLMNoToolFieldsWithoutTools(t *testing.T) {
+	var raw map[string]any
+	srv := chatServer(t, nil, &raw, `[DONE]`)
+	llm := NewLLM("sk-x", LLMOptions{httpOptions: opts(srv.URL)})
+	ch, err := llm.Chat(context.Background(), provider.ChatRequest{
+		Messages:   []provider.Message{{Role: provider.RoleUser, Content: "hi"}},
+		ToolChoice: provider.ToolChoice{Mode: provider.ToolChoiceAuto},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain(t, ch)
+	for _, k := range []string{"tools", "tool_choice", "parallel_tool_calls"} {
+		if _, present := raw[k]; present {
+			t.Errorf("%s is present on a request that declares no tools", k)
+		}
+	}
+}
+
+// TestLLMToolHistoryReplay: an assistant turn that spoke and called, then the
+// tool result, projected onto the Chat Completions shape.
+func TestLLMToolHistoryReplay(t *testing.T) {
+	var raw map[string]any
+	srv := chatServer(t, nil, &raw, `[DONE]`)
+	llm := NewLLM("sk-x", LLMOptions{httpOptions: opts(srv.URL)})
+	ch, err := llm.Chat(context.Background(), provider.ChatRequest{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: "put me through to sales"},
+			{Role: provider.RoleAssistant, Content: "One moment.", ToolCalls: []provider.ToolCall{
+				{ID: "call_abc", Name: "transfer_to_agent", Arguments: `{"department":"sales"}`},
+			}},
+			{Role: provider.RoleTool, ToolCallID: "call_abc", Content: "no agent available"},
+		},
+		Tools: []provider.ToolDef{{Name: "transfer_to_agent"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain(t, ch)
+	msgs, _ := raw["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("messages = %v", msgs)
+	}
+	assistant := msgs[1].(map[string]any)
+	tcs, _ := assistant["tool_calls"].([]any)
+	if assistant["content"] != "One moment." || len(tcs) != 1 {
+		t.Fatalf("assistant message = %v", assistant)
+	}
+	tc := tcs[0].(map[string]any)
+	fn, _ := tc["function"].(map[string]any)
+	if tc["id"] != "call_abc" || tc["type"] != "function" || fn["name"] != "transfer_to_agent" || fn["arguments"] != `{"department":"sales"}` {
+		t.Errorf("tool_calls[0] = %v", tc)
+	}
+	result := msgs[2].(map[string]any)
+	if result["role"] != "tool" || result["tool_call_id"] != "call_abc" || result["content"] != "no agent available" {
+		t.Errorf("tool result message = %v", result)
+	}
+	if _, present := msgs[0].(map[string]any)["tool_calls"]; present {
+		t.Error("a plain user message must not carry tool_calls")
+	}
+}
+
+// TestLLMToolChoiceModes: the wire mapping of every tool_choice form.
+func TestLLMToolChoiceModes(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		choice provider.ToolChoice
+		want   any
+	}{
+		{"zero value defaults to auto", provider.ToolChoice{}, "auto"},
+		{"auto", provider.ToolChoice{Mode: provider.ToolChoiceAuto}, "auto"},
+		{"none", provider.ToolChoice{Mode: provider.ToolChoiceNone}, "none"},
+		{"required", provider.ToolChoice{Mode: provider.ToolChoiceRequired}, "required"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var raw map[string]any
+			srv := chatServer(t, nil, &raw, `[DONE]`)
+			llm := NewLLM("sk-x", LLMOptions{httpOptions: opts(srv.URL)})
+			ch, err := llm.Chat(context.Background(), provider.ChatRequest{
+				Tools: []provider.ToolDef{{Name: "hangup"}}, ToolChoice: tc.choice,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			drain(t, ch)
+			if got := raw["tool_choice"]; got != tc.want {
+				t.Errorf("tool_choice = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

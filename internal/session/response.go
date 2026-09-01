@@ -34,6 +34,18 @@ type response struct {
 	usage        Usage
 	tag          string
 
+	// Tools and toolChoice are captured when the response is created, so a
+	// session.update landing during the awaiting phase does not change a
+	// generation that is already under way.
+	tools      []provider.ToolDef
+	toolChoice provider.ToolChoice
+
+	// spoke records whether any text delta arrived; toolItem is the
+	// function_call item, already delivered and completed, that
+	// response.done must still list. Both are set by the actor.
+	spoke    bool
+	toolItem ItemRef
+
 	// Observability: the response span and its llm / tts children, plus the
 	// timestamps the core latency metrics are derived from.
 	ctx          context.Context // response span context; the pipeline ctx derives from it
@@ -62,11 +74,13 @@ func (r *response) outcome() (ResponseStatus, StatusReason) {
 }
 
 // done reports whether every progress flag required by the modality is set.
+// A turn that produced no text has nothing to synthesize — a call-only turn
+// is finished the moment the LLM is — so the TTS flags do not gate it.
 func (r *response) done() bool {
 	if !r.llmDone {
 		return false
 	}
-	return r.textOnly || (r.ttsDone && r.audioFlushed)
+	return r.textOnly || !r.spoke || (r.ttsDone && r.audioFlushed)
 }
 
 // ---- pipeline → actor progress facts (internal, generation-stamped) --------
@@ -82,6 +96,15 @@ type pipeLLMDone struct {
 	Gen    Generation
 	Finish provider.FinishReason
 	Usage  Usage
+}
+
+// pipeToolCall carries one complete tool call from the pipeline to the actor.
+// It is the single delivery path: pipeLLMDone never carries a call, so there
+// is exactly one place that can create the function_call item and no ordering
+// question between two of them.
+type pipeToolCall struct {
+	Gen  Generation
+	Call provider.ToolCall
 }
 
 type pipeTTSDone struct{ Gen Generation }
@@ -106,6 +129,7 @@ type pipeError struct {
 }
 
 func (pipeLLMDone) isEvent()   {}
+func (pipeToolCall) isEvent()  {}
 func (pipeTTSDone) isEvent()   {}
 func (pipeTTSStart) isEvent()  {}
 func (pipeSegment) isEvent()   {}
@@ -113,6 +137,7 @@ func (pipeAlignment) isEvent() {}
 func (pipeError) isEvent()     {}
 
 func (e pipeLLMDone) generation() Generation   { return e.Gen }
+func (e pipeToolCall) generation() Generation  { return e.Gen }
 func (e pipeTTSDone) generation() Generation   { return e.Gen }
 func (e pipeTTSStart) generation() Generation  { return e.Gen }
 func (e pipeSegment) generation() Generation   { return e.Gen }

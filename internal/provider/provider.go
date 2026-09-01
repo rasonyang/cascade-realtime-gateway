@@ -104,22 +104,68 @@ const (
 	RoleSystem    Role = "system"
 	RoleUser      Role = "user"
 	RoleAssistant Role = "assistant"
+	// RoleTool carries the result of a tool the client executed. ToolCallID
+	// names the call it answers.
+	RoleTool Role = "tool"
 )
 
-// Message is one turn of conversation context.
+// ToolDef is one function the model may call. Parameters is an opaque JSON
+// Schema object, passed through verbatim; Cascade does not interpret it. An
+// empty Parameters means a no-argument tool.
+type ToolDef struct {
+	Name        string
+	Description string
+	Parameters  json.RawMessage
+}
+
+// Tool choice modes. ToolChoiceFunction forces the function named by
+// ToolChoice.Name.
+const (
+	ToolChoiceAuto     = "auto"
+	ToolChoiceNone     = "none"
+	ToolChoiceRequired = "required"
+	ToolChoiceFunction = "function"
+)
+
+// ToolChoice mirrors the GA field. Cascade's session model always resolves it
+// to an explicit value, so adapters never inherit a provider default; the
+// zero value is treated as ToolChoiceAuto.
+type ToolChoice struct {
+	Mode string
+	Name string // set only when Mode == ToolChoiceFunction
+}
+
+// ToolCall is one complete call the model asked for. Arguments is the raw
+// JSON string the model produced; Cascade never parses it. Adapters
+// accumulate streamed argument fragments internally and only ever surface a
+// complete call.
+type ToolCall struct {
+	ID        string
+	Name      string
+	Arguments string
+}
+
+// Message is one turn of conversation context. An assistant turn that spoke
+// and called a tool carries both Content and ToolCalls; a RoleTool message
+// carries the tool result in Content and the call it answers in ToolCallID.
 type Message struct {
-	Role    Role
-	Content string
+	Role       Role
+	Content    string
+	ToolCalls  []ToolCall
+	ToolCallID string
 }
 
 // ChatRequest is a single, request-scoped generation. Temperature is nil when
 // the caller wants the provider's own default; 0 is a meaningful value, so the
-// field is a pointer rather than a sentinel.
+// field is a pointer rather than a sentinel. ToolChoice is a value, not a
+// pointer: when Tools is non-empty the effective choice is always sent.
 type ChatRequest struct {
 	Instructions    string
 	Messages        []Message
 	MaxOutputTokens int // 0 means no limit
 	Temperature     *float64
+	Tools           []ToolDef
+	ToolChoice      ToolChoice
 }
 
 // FinishReason mirrors the OpenAI finish reasons Cascade maps.
@@ -142,6 +188,9 @@ type LLMChunkKind int
 
 const (
 	LLMTextDelta LLMChunkKind = iota + 1
+	// LLMToolCall carries one complete tool call. At most one is emitted per
+	// generation, always before LLMDone.
+	LLMToolCall
 	LLMDone
 	LLMError
 )
@@ -151,6 +200,7 @@ const (
 type LLMChunk struct {
 	Kind         LLMChunkKind
 	Text         string
+	ToolCall     ToolCall
 	FinishReason FinishReason
 	Usage        Usage
 	Err          error

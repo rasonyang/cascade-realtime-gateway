@@ -302,24 +302,115 @@ func decodeSessionUpdate(env envelope) (sessionUpdate, *wireErr) {
 			return out, err
 		}
 	}
+	if sess.has("tools") && !sess.null("tools") {
+		tools, err := decodeTools(sess)
+		if err != nil {
+			return out, err
+		}
+		out.patch.Tools = tools
+	}
+	if sess.has("tool_choice") && !sess.null("tool_choice") {
+		tc, err := decodeToolChoice(sess, "tool_choice")
+		if err != nil {
+			return out, err
+		}
+		out.patch.ToolChoice = &tc
+	}
 	if err := checkDefaultedFields(sess); err != nil {
 		return out, err
 	}
 	return out, nil
 }
 
+// decodeTools reads session.tools. The values themselves (duplicate names, a
+// forced function naming nothing) are checked by the shared session
+// validation, so the rules live in one place; this only fixes the shape.
+func decodeTools(sess obj) ([]config.Tool, *wireErr) {
+	arr, _, err := sess.array("tools")
+	if err != nil {
+		return nil, err
+	}
+	tools := make([]config.Tool, 0, len(arr))
+	for i, raw := range arr {
+		path := fmt.Sprintf("%s[%d]", sess.pathOf("tools"), i)
+		t, perr := parseObject(raw, path)
+		if perr != nil {
+			return nil, perr
+		}
+		// The discriminator decides which shape this is, so it is read before
+		// the allow-list: an MCP tool must be rejected on its type, not on
+		// whichever of its own fields happens to come first.
+		typ, ok, err := t.str("type")
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, missingParam(t.pathOf("type"))
+		}
+		if typ != config.ToolTypeFunction {
+			return nil, unsupportedValue(t.pathOf("type"), typ, "['function']")
+		}
+		if err := t.allow("type", "name", "description", "parameters"); err != nil {
+			return nil, err
+		}
+		name, ok, err := t.str("name")
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, missingParam(t.pathOf("name"))
+		}
+		desc, _, err := t.str("description")
+		if err != nil {
+			return nil, err
+		}
+		tool := config.Tool{Type: typ, Name: name, Description: desc}
+		if t.has("parameters") && !t.null("parameters") {
+			// Passed to the provider verbatim; Cascade never interprets it.
+			tool.Parameters = t.m["parameters"]
+		}
+		tools = append(tools, tool)
+	}
+	return tools, nil
+}
+
+// decodeToolChoice reads the GA union: one of the mode strings, or a
+// {"type":"function","name":…} object.
+func decodeToolChoice(o obj, key string) (config.ToolChoice, *wireErr) {
+	path := o.pathOf(key)
+	// str reports presence, not string-ness: a non-string value comes back
+	// with ok set and an error, so both must be checked.
+	if v, ok, err := o.str(key); ok && err == nil {
+		switch v {
+		case config.ToolChoiceAuto, config.ToolChoiceNone, config.ToolChoiceRequired:
+			return config.ToolChoice{Mode: v}, nil
+		}
+		return config.ToolChoice{}, unsupportedValue(path, v, "['auto', 'none', 'required']")
+	}
+	sub, ok, err := o.object(key)
+	if err != nil || !ok {
+		return config.ToolChoice{}, invalidValue(path, fmt.Sprintf(
+			"Invalid value for '%s': expected 'auto', 'none', 'required' or a function object.", path))
+	}
+	typ, _, _ := sub.str("type")
+	if typ != config.ToolChoiceFunction {
+		return config.ToolChoice{}, unsupportedValue(path+".type", typ, "['function']")
+	}
+	if err := sub.allow("type", "name"); err != nil {
+		return config.ToolChoice{}, err
+	}
+	name, ok, err := sub.str("name")
+	if err != nil {
+		return config.ToolChoice{}, err
+	}
+	if !ok {
+		return config.ToolChoice{}, missingParam(path + ".name")
+	}
+	return config.ToolChoice{Mode: config.ToolChoiceFunction, Name: name}, nil
+}
+
 // checkDefaultedFields accepts the profile §3 "ignored" values only.
 func checkDefaultedFields(sess obj) *wireErr {
-	if arr, ok, err := sess.array("tools"); err != nil {
-		return err
-	} else if ok && len(arr) != 0 {
-		return unsupportedParam(sess.pathOf("tools"))
-	}
-	if v, ok, err := sess.str("tool_choice"); err != nil {
-		return unsupportedParam(sess.pathOf("tool_choice"))
-	} else if ok && v != "auto" && v != "none" {
-		return unsupportedValue(sess.pathOf("tool_choice"), v, "['auto', 'none']")
-	}
 	if v, ok, err := sess.str("truncation"); err != nil {
 		return unsupportedParam(sess.pathOf("truncation"))
 	} else if ok && v != "auto" {
@@ -546,6 +637,9 @@ type itemCreate struct {
 	spec     session.ItemSpec
 	previous string
 	hasPrev  bool
+	// callID is the wire call id of a function_call_output; the adapter
+	// resolves it to the function_call item it answers.
+	callID string
 }
 
 func decodeItemCreate(env envelope) (itemCreate, *wireErr) {
@@ -575,8 +669,14 @@ func decodeItemCreate(env envelope) (itemCreate, *wireErr) {
 	if !ok {
 		return out, missingParam(it.pathOf("type"))
 	}
-	if typ != "message" {
-		return out, unsupportedValue(it.pathOf("type"), typ, "['message']")
+	switch typ {
+	case "message":
+	case "function_call_output":
+		return decodeToolOutputItem(it, out)
+	default:
+		// function_call is server-emitted only: seeding a call the model
+		// never made has no consumer.
+		return out, unsupportedValue(it.pathOf("type"), typ, "['message', 'function_call_output']")
 	}
 	for _, k := range []string{"call_id", "name", "arguments", "output"} {
 		if it.has(k) {
@@ -698,6 +798,42 @@ func decodeItemTruncate(env envelope) (itemTruncate, *wireErr) {
 		return out, missingParam("audio_end_ms")
 	}
 	out.audioEndMs = ms
+	return out, nil
+}
+
+// decodeToolOutputItem reads a function_call_output. The result itself is an
+// opaque string Cascade never interprets, and it may be empty.
+func decodeToolOutputItem(it obj, out itemCreate) (itemCreate, *wireErr) {
+	for _, k := range []string{"role", "content", "name", "arguments"} {
+		if it.has(k) {
+			return out, unknownParam(it.pathOf(k))
+		}
+	}
+	if id, ok, err := it.str("id"); err != nil {
+		return out, err
+	} else if ok {
+		if id == "" {
+			return out, invalidValue(it.pathOf("id"), "Invalid value for 'item.id': must not be empty.")
+		}
+		out.spec.ClientID = id
+	}
+	callID, ok, err := it.str("call_id")
+	if err != nil {
+		return out, err
+	}
+	if !ok || callID == "" {
+		return out, missingParam(it.pathOf("call_id"))
+	}
+	output, ok, err := it.str("output")
+	if err != nil {
+		return out, err
+	}
+	if !ok {
+		return out, missingParam(it.pathOf("output"))
+	}
+	out.spec.Content = session.ContentToolOutput
+	out.spec.Text = output
+	out.callID = callID
 	return out, nil
 }
 

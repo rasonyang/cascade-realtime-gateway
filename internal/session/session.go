@@ -601,6 +601,12 @@ func (s *Session) updateSession(p SessionPatch, tag string) {
 			next.Audio.Input.TurnDetection.ApplyDefaults()
 		}
 	}
+	if p.Tools != nil {
+		next.Tools = config.CloneTools(p.Tools)
+	}
+	if p.ToolChoice != nil {
+		next.ToolChoice = *p.ToolChoice
+	}
 	if err := next.Validate("session"); err != nil {
 		s.emitParamError(tag, ErrCodeInvalidSession, fieldOf(err), err.Error())
 		return
@@ -613,17 +619,10 @@ func (s *Session) updateSession(p SessionPatch, tag string) {
 }
 
 func (s *Session) createItem(c CmdCreateItem, tag string) {
-	switch c.Item.Role {
-	case RoleUser, RoleAssistant, RoleSystem:
-	default:
-		s.emitParamError(tag, ErrCodeInvalidItem, "item.role", fmt.Sprintf("unsupported role %q", c.Item.Role))
+	it, ok := s.newClientItem(c.Item, tag)
+	if !ok {
 		return
 	}
-	if c.Item.Text == "" {
-		s.emitParamError(tag, ErrCodeInvalidItem, "item.content", "item text must not be empty")
-		return
-	}
-	it := &item{Item: Item{ClientID: c.Item.ClientID, Role: c.Item.Role, Content: ContentText, Status: ItemCompleted, Text: c.Item.Text, TranscriptDone: true}}
 	prev, ok := s.conv.insert(it, c.PreviousItem, c.AtRoot)
 	if !ok {
 		s.emitParamError(tag, ErrCodeItemNotFound, "previous_item_id", "previous item not found")
@@ -631,6 +630,43 @@ func (s *Session) createItem(c CmdCreateItem, tag string) {
 	}
 	s.emit(EvItemAdded{Item: it.snapshot(), PreviousItem: prev})
 	s.emit(EvItemDone{Item: it.snapshot()})
+}
+
+// newClientItem validates a client-created item spec and builds the item, or
+// emits the rejection and returns false.
+func (s *Session) newClientItem(spec ItemSpec, tag string) (*item, bool) {
+	if spec.Content == ContentToolOutput {
+		return s.newToolOutputItem(spec, tag)
+	}
+	switch spec.Role {
+	case RoleUser, RoleAssistant, RoleSystem:
+	default:
+		s.emitParamError(tag, ErrCodeInvalidItem, "item.role", fmt.Sprintf("unsupported role %q", spec.Role))
+		return nil, false
+	}
+	if spec.Text == "" {
+		s.emitParamError(tag, ErrCodeInvalidItem, "item.content", "item text must not be empty")
+		return nil, false
+	}
+	return &item{Item: Item{ClientID: spec.ClientID, Role: spec.Role, Content: ContentText,
+		Status: ItemCompleted, Text: spec.Text, TranscriptDone: true}}, true
+}
+
+// newToolOutputItem builds a function_call_output. The tool result itself is
+// opaque and may be empty; what must hold is that it answers a call the model
+// actually made, exactly once.
+func (s *Session) newToolOutputItem(spec ItemSpec, tag string) (*item, bool) {
+	call, ok := s.conv.get(spec.CallItem)
+	if !ok || call.Content != ContentToolCall {
+		s.emitParamError(tag, ErrCodeInvalidItem, "item.call_id", "no function_call with this call_id exists")
+		return nil, false
+	}
+	if s.conv.answered(call.CallID) {
+		s.emitParamError(tag, ErrCodeInvalidItem, "item.call_id", "a function_call_output already exists for this call")
+		return nil, false
+	}
+	return &item{Item: Item{ClientID: spec.ClientID, Content: ContentToolOutput, Status: ItemCompleted,
+		Text: spec.Text, CallID: call.CallID, Name: call.Name, TranscriptDone: true}}, true
 }
 
 func (s *Session) deleteItem(ref ItemRef, tag string) {
@@ -917,6 +953,8 @@ func (s *Session) createResponse(ov ResponseOverrides, tag string) {
 		voice:        probe.Audio.Output.Voice,
 		tag:          tag,
 		anchorAt:     time.Now(),
+		tools:        toolDefs(s.cfg.Tools),
+		toolChoice:   toolChoice(s.cfg.ToolChoice),
 	}
 	if p := s.pendingItem; p != nil && !s.committedAt.IsZero() {
 		r.anchorAt = s.committedAt // E2E latency starts at the user's turn end
@@ -956,26 +994,22 @@ func (s *Session) startPipeline(r *response) {
 	s.activeGen++
 	r.gen = s.activeGen
 
-	content := ContentAudio
-	if r.textOnly {
-		content = ContentText
-	}
-	out := &item{Item: Item{Role: RoleAssistant, Content: content, Status: ItemInProgress, TranscriptDone: true}}
-	prev := s.conv.append(out)
-	r.item = out.Ref
-	s.emit(EvOutputItemAdded{Resp: r.ref, Item: out.snapshot(), PreviousItem: prev})
-
+	// The message item is created lazily, on the first piece of output (see
+	// ensureOutputItem): a turn that only calls a tool must not leave an
+	// empty message item in response.done.output.
 	ctx, cancel := context.WithCancel(r.ctx)
 	r.cancel = cancel
 	r.startedAt = time.Now()
 	ctx, r.llmSpan = s.tel.Tracer.Start(ctx, "llm")
 	p := &pipeline{
-		ctx: ctx, gen: r.gen, resp: r.ref, item: r.item, textOnly: r.textOnly,
+		ctx: ctx, gen: r.gen, resp: r.ref, textOnly: r.textOnly,
 		req: provider.ChatRequest{
 			Instructions:    r.instructions,
 			Messages:        s.conv.messages(),
 			MaxOutputTokens: r.maxTokens,
 			Temperature:     s.temp,
+			Tools:           r.tools,
+			ToolChoice:      r.toolChoice,
 		},
 		ttsCfg: s.ttsConfig(r.voice),
 		llm:    s.llm, tts: s.tts, out: s.respEvents,
@@ -1002,23 +1036,27 @@ func (s *Session) handleResponseEvent(ev Event) {
 	if !ok || r == nil || r.awaiting || st.generation() != s.activeGen {
 		return // stale generation or no active response
 	}
-	out, ok := s.conv.get(r.item)
-	if !ok {
-		return // defensive: the output item is protected from deletion above
-	}
 	switch e := ev.(type) {
 	case EvOutputTextDelta:
+		out := s.ensureOutputItem(r)
 		out.Text += e.Delta
 		s.noteFirstText(r)
+		e.Item = r.item
 		s.emit(e)
 	case EvOutputAudioTranscriptDelta:
+		out := s.ensureOutputItem(r)
 		out.Text += e.Delta
 		s.noteFirstText(r)
+		e.Item = r.item
 		s.emit(e)
+	case pipeToolCall:
+		s.deliverToolCall(r, e.Call)
 	case EvOutputAudioDelta:
+		out := s.ensureOutputItem(r)
 		out.audioB += len(e.PCM)
 		out.AudioMs = audio.BytesToMs(out.audioB)
 		s.audioEmitted = true
+		e.Item = r.item
 		if r.firstAudioAt.IsZero() {
 			r.firstAudioAt = time.Now()
 			if !r.ttsStartedAt.IsZero() {
@@ -1031,9 +1069,13 @@ func (s *Session) handleResponseEvent(ev Event) {
 		r.ttsStartedAt = time.Now()
 		_, r.ttsSpan = s.tel.Tracer.Start(r.ctx, "tts")
 	case pipeAlignment:
-		out.alignment = append(out.alignment, e.Timings...)
+		if out, ok := s.conv.get(r.item); ok {
+			out.alignment = append(out.alignment, e.Timings...)
+		}
 	case pipeSegment:
-		out.segments = append(out.segments, e.Seg)
+		if out, ok := s.conv.get(r.item); ok {
+			out.segments = append(out.segments, e.Seg)
+		}
 	case pipeLLMDone:
 		r.llmDone = true
 		r.finish = e.Finish
@@ -1048,12 +1090,15 @@ func (s *Session) handleResponseEvent(ev Event) {
 	case pipeTTSDone:
 		r.ttsDone = true
 		r.audioFlushed = true // deltas precede this event on the same channel
+		out, spoke := s.conv.get(r.item)
 		if r.ttsSpan != nil {
-			r.ttsSpan.SetAttributes(attribute.Int("cascade.audio_ms", out.AudioMs))
+			if spoke {
+				r.ttsSpan.SetAttributes(attribute.Int("cascade.audio_ms", out.AudioMs))
+			}
 			r.ttsSpan.End()
 			r.ttsSpan = nil
 		}
-		if len(out.segments) == 0 && len(out.alignment) == 0 {
+		if spoke && len(out.segments) == 0 && len(out.alignment) == 0 {
 			// Incremental provider without alignment: tier-3 single segment.
 			out.segments = []audioSegment{{textStart: 0, textEnd: len(out.Text), audioStart: 0, audioEnd: out.audioB}}
 		}
@@ -1069,6 +1114,42 @@ func (s *Session) handleResponseEvent(ev Event) {
 		}
 		s.failResponse(r, ErrCodeProviderError, e.Err)
 	}
+}
+
+// ensureOutputItem returns the response's message item, creating it on the
+// first piece of output. Deferring creation to the first delta is what keeps
+// a call-only turn from emitting an empty message item, which GA does not do.
+func (s *Session) ensureOutputItem(r *response) *item {
+	if out, ok := s.conv.get(r.item); ok {
+		return out
+	}
+	content := ContentAudio
+	if r.textOnly {
+		content = ContentText
+	}
+	out := &item{Item: Item{Role: RoleAssistant, Content: content, Status: ItemInProgress, TranscriptDone: true}}
+	prev := s.conv.append(out)
+	r.item = out.Ref
+	s.emit(EvOutputItemAdded{Resp: r.ref, Item: out.snapshot(), PreviousItem: prev})
+	return out
+}
+
+// deliverToolCall commits the function_call item and emits its whole
+// lifecycle the moment the adapter yields a complete call. This is the single
+// delivery path, and delivery is final: a later cancel does not retract the
+// item, it only stops whatever would have followed.
+func (s *Session) deliverToolCall(r *response, call provider.ToolCall) {
+	if r.toolItem != 0 {
+		return // at most one call per response
+	}
+	it := &item{Item: Item{Content: ContentToolCall, Status: ItemInProgress,
+		Name: call.Name, CallID: call.ID, Text: call.Arguments, TranscriptDone: true}}
+	prev := s.conv.append(it)
+	r.toolItem = it.Ref
+	s.emit(EvOutputItemAdded{Resp: r.ref, Item: it.snapshot(), PreviousItem: prev})
+	s.emit(EvToolCallArguments{Resp: r.ref, Item: it.Ref, Arguments: call.Arguments})
+	it.Status = ItemCompleted
+	s.emit(EvOutputItemDone{Resp: r.ref, Item: it.snapshot()})
 }
 
 func (s *Session) maybeComplete(r *response) {
@@ -1107,24 +1188,27 @@ func (s *Session) finish(r *response, status ResponseStatus, reason StatusReason
 	s.stopASRWait()
 
 	var output []Item
-	if r.item != 0 {
-		out, _ := s.conv.get(r.item)
-		if out != nil {
-			if status == ResponseCompleted {
-				out.Status = ItemCompleted
-			} else {
-				out.Status = ItemIncomplete
-			}
-			if r.textOnly {
-				s.emit(EvOutputTextDone{Resp: r.ref, Item: r.item, Text: out.Text})
-			} else {
-				// Profile §7: audio done precedes transcript done.
-				s.emit(EvOutputAudioDone{Resp: r.ref, Item: r.item})
-				s.emit(EvOutputAudioTranscriptDone{Resp: r.ref, Item: r.item, Text: out.Text})
-			}
-			s.emit(EvOutputItemDone{Resp: r.ref, Item: out.snapshot()})
-			output = []Item{out.snapshot()}
+	if out, ok := s.conv.get(r.item); ok {
+		if status == ResponseCompleted {
+			out.Status = ItemCompleted
+		} else {
+			out.Status = ItemIncomplete
 		}
+		if r.textOnly {
+			s.emit(EvOutputTextDone{Resp: r.ref, Item: r.item, Text: out.Text})
+		} else {
+			// Profile §7: audio done precedes transcript done.
+			s.emit(EvOutputAudioDone{Resp: r.ref, Item: r.item})
+			s.emit(EvOutputAudioTranscriptDone{Resp: r.ref, Item: r.item, Text: out.Text})
+		}
+		s.emit(EvOutputItemDone{Resp: r.ref, Item: out.snapshot()})
+		output = append(output, out.snapshot())
+	}
+	// A delivered function_call item closed its own lifecycle at delivery, so
+	// it is only listed here — never re-emitted, and never reopened by a
+	// cancel that arrived afterwards.
+	if call, ok := s.conv.get(r.toolItem); ok {
+		output = append(output, call.snapshot())
 	}
 	s.emit(EvResponseDone{Resp: r.ref, Status: status, Reason: reason, ErrCode: r.failCode, Err: err, Usage: r.usage, Output: output})
 	s.active = nil
@@ -1150,8 +1234,10 @@ func (s *Session) finish(r *response, status ResponseStatus, reason StatusReason
 	r.span.End()
 }
 
-// noteFirstText records LLM TTFT (and E2E for text-only responses).
+// noteFirstText records that the turn spoke, plus LLM TTFT (and E2E for
+// text-only responses).
 func (s *Session) noteFirstText(r *response) {
+	r.spoke = true
 	if !r.firstTextAt.IsZero() {
 		return
 	}
@@ -1163,3 +1249,24 @@ func (s *Session) noteFirstText(r *response) {
 }
 
 func millis(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
+
+// toolDefs and toolChoice project the session's tool configuration onto the
+// provider types. tool_choice is always resolved to an explicit value here,
+// so no adapter ever falls back on a provider default.
+func toolDefs(tools []config.Tool) []provider.ToolDef {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]provider.ToolDef, len(tools))
+	for i, t := range tools {
+		out[i] = provider.ToolDef{Name: t.Name, Description: t.Description, Parameters: t.Parameters}
+	}
+	return out
+}
+
+func toolChoice(tc config.ToolChoice) provider.ToolChoice {
+	if tc.Mode == "" {
+		return provider.ToolChoice{Mode: provider.ToolChoiceAuto}
+	}
+	return provider.ToolChoice{Mode: tc.Mode, Name: tc.Name}
+}

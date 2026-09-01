@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -270,4 +271,137 @@ func TestAdminKeyEnablesAdminWithDefaults(t *testing.T) {
 
 func TestDefaultConfigFailsValidationWithoutSecrets(t *testing.T) {
 	wantFieldError(t, DefaultConfig().Validate(nil), "auth.api_key", "empty")
+}
+
+// TestToolChoiceJSONRoundTrip: the GA union round-trips to the form it names,
+// so the echoed session object matches what the client sent.
+func TestToolChoiceJSONRoundTrip(t *testing.T) {
+	for _, tc := range []struct {
+		json string
+		want ToolChoice
+	}{
+		{`"auto"`, ToolChoice{Mode: ToolChoiceAuto}},
+		{`"none"`, ToolChoice{Mode: ToolChoiceNone}},
+		{`"required"`, ToolChoice{Mode: ToolChoiceRequired}},
+		{`{"type":"function","name":"hangup"}`, ToolChoice{Mode: ToolChoiceFunction, Name: "hangup"}},
+	} {
+		var got ToolChoice
+		if err := json.Unmarshal([]byte(tc.json), &got); err != nil {
+			t.Fatalf("%s: %v", tc.json, err)
+		}
+		if got != tc.want {
+			t.Errorf("%s decoded to %+v, want %+v", tc.json, got, tc.want)
+		}
+		back, err := json.Marshal(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(back) != tc.json {
+			t.Errorf("%s re-encoded as %s", tc.json, back)
+		}
+	}
+	// The zero value echoes the default rather than an empty string.
+	back, _ := json.Marshal(ToolChoice{})
+	if string(back) != `"auto"` {
+		t.Errorf("zero value encoded as %s, want \"auto\"", back)
+	}
+	if err := json.Unmarshal([]byte(`42`), new(ToolChoice)); err == nil {
+		t.Error("a number was accepted as tool_choice")
+	}
+}
+
+// TestSessionDefaultsToolValidation: the dotted field paths the protocol
+// layer reports back to the client.
+func TestSessionDefaultsToolValidation(t *testing.T) {
+	base := func() SessionDefaults {
+		s := DefaultProfile().SessionDefaults()
+		s.Audio.Input.TurnDetection.ApplyDefaults()
+		return s
+	}
+	fn := func(name string) Tool { return Tool{Type: ToolTypeFunction, Name: name} }
+	for _, tc := range []struct {
+		name  string
+		mut   func(*SessionDefaults)
+		field string
+	}{
+		{"valid", func(s *SessionDefaults) { s.Tools = []Tool{fn("a")} }, ""},
+		{"valid with schema", func(s *SessionDefaults) {
+			t := fn("a")
+			t.Parameters = json.RawMessage(`{"type":"object"}`)
+			s.Tools = []Tool{t}
+		}, ""},
+		{"bad type", func(s *SessionDefaults) { s.Tools = []Tool{{Type: "mcp", Name: "a"}} }, "session.tools[0].type"},
+		{"empty name", func(s *SessionDefaults) { s.Tools = []Tool{{Type: ToolTypeFunction}} }, "session.tools[0].name"},
+		{"duplicate name", func(s *SessionDefaults) { s.Tools = []Tool{fn("a"), fn("a")} }, "session.tools[1].name"},
+		{"array parameters", func(s *SessionDefaults) {
+			t := fn("a")
+			t.Parameters = json.RawMessage(`[]`)
+			s.Tools = []Tool{t}
+		}, "session.tools[0].parameters"},
+		{"bad mode", func(s *SessionDefaults) { s.ToolChoice = ToolChoice{Mode: "maybe"} }, "session.tool_choice"},
+		{"forced unknown function", func(s *SessionDefaults) {
+			s.Tools = []Tool{fn("a")}
+			s.ToolChoice = ToolChoice{Mode: ToolChoiceFunction, Name: "b"}
+		}, "session.tool_choice.name"},
+		{"forced known function", func(s *SessionDefaults) {
+			s.Tools = []Tool{fn("a")}
+			s.ToolChoice = ToolChoice{Mode: ToolChoiceFunction, Name: "a"}
+		}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := base()
+			tc.mut(&s)
+			err := s.Validate("session")
+			if tc.field == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			var fe *FieldError
+			if !errors.As(err, &fe) {
+				t.Fatalf("error = %v, want a FieldError", err)
+			}
+			if fe.Field != tc.field {
+				t.Errorf("field = %q, want %q", fe.Field, tc.field)
+			}
+		})
+	}
+}
+
+// TestProfileToolChoice: the default is "auto" and a profile may not force a
+// function, because it declares no tools to force.
+func TestProfileToolChoice(t *testing.T) {
+	if got := DefaultProfile().ToolChoice; got != (ToolChoice{Mode: ToolChoiceAuto}) {
+		t.Fatalf("default tool_choice = %+v", got)
+	}
+	if got := DefaultProfile().SessionDefaults().ToolChoice; got != (ToolChoice{Mode: ToolChoiceAuto}) {
+		t.Fatalf("projected tool_choice = %+v", got)
+	}
+	p := DefaultProfile()
+	p.Name = "p"
+	p.TurnDetection.ApplyDefaults()
+	p.ToolChoice = ToolChoice{Mode: ToolChoiceFunction, Name: "hangup"}
+	err := p.validate("profiles.p", "p")
+	var fe *FieldError
+	if !errors.As(err, &fe) || fe.Field != "profiles.p.tool_choice" {
+		t.Fatalf("error = %v, want profiles.p.tool_choice", err)
+	}
+	p.ToolChoice = ToolChoice{Mode: ToolChoiceNone}
+	if err := p.validate("profiles.p", "p"); err != nil {
+		t.Fatalf(`"none" rejected on a profile: %v`, err)
+	}
+}
+
+// TestSessionDefaultsCloneTools: a snapshot must not share tool state with
+// the session it was copied from.
+func TestSessionDefaultsCloneTools(t *testing.T) {
+	s := DefaultProfile().SessionDefaults()
+	s.Tools = []Tool{{Type: ToolTypeFunction, Name: "a", Parameters: json.RawMessage(`{"type":"object"}`)}}
+	c := s.Clone()
+	c.Tools[0].Name = "b"
+	c.Tools[0].Parameters[1] = 'X'
+	if s.Tools[0].Name != "a" || string(s.Tools[0].Parameters) != `{"type":"object"}` {
+		t.Fatalf("clone shares state: %+v", s.Tools[0])
+	}
 }

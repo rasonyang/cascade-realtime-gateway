@@ -99,17 +99,50 @@ func (c *conversation) last(role Role) *item {
 
 func (c *conversation) count() int { return len(c.items) }
 
-// messages projects the conversation into LLM chat messages. Items without
-// text (an audio item whose transcript never arrived) are skipped.
+// messages projects the conversation into LLM chat messages.
+//
+// Two shapes need care. An assistant turn that spoke and then called a tool
+// is stored as two items but must be replayed as one assistant message
+// carrying both the text and the call, so the tool result that follows
+// answers a call the model can see. And a function_call_output becomes a
+// tool-role message keyed by the provider's call id.
+//
+// Items without text (an audio item whose transcript never arrived) are
+// skipped, but that must never swallow a tool item: a no-argument call and an
+// empty tool result are both legitimate and both carry no text.
 func (c *conversation) messages() []provider.Message {
 	out := make([]provider.Message, 0, len(c.items))
 	for _, it := range c.items {
-		if it.Text == "" {
-			continue
+		switch it.Content {
+		case ContentToolCall:
+			call := provider.ToolCall{ID: it.CallID, Name: it.Name, Arguments: it.Text}
+			// Merge into the assistant message immediately before, when there
+			// is one: one turn, one message.
+			if n := len(out); n > 0 && out[n-1].Role == provider.RoleAssistant && out[n-1].ToolCalls == nil {
+				out[n-1].ToolCalls = []provider.ToolCall{call}
+				continue
+			}
+			out = append(out, provider.Message{Role: provider.RoleAssistant, ToolCalls: []provider.ToolCall{call}})
+		case ContentToolOutput:
+			out = append(out, provider.Message{Role: provider.RoleTool, ToolCallID: it.CallID, Content: it.Text})
+		default:
+			if it.Text == "" {
+				continue
+			}
+			out = append(out, provider.Message{Role: provider.Role(it.Role), Content: it.Text})
 		}
-		out = append(out, provider.Message{Role: provider.Role(it.Role), Content: it.Text})
 	}
 	return out
+}
+
+// answered reports whether a function_call_output for callID already exists.
+func (c *conversation) answered(callID string) bool {
+	for _, it := range c.items {
+		if it.Content == ContentToolOutput && it.CallID == callID {
+			return true
+		}
+	}
+	return false
 }
 
 // snapshot returns the public view of an item.

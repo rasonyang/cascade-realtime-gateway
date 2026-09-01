@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -69,6 +70,77 @@ type SessionDefaults struct {
 	OutputModalities []string        `json:"output_modalities"`
 	Audio            Audio           `json:"audio"`
 	MaxOutputTokens  MaxOutputTokens `json:"max_output_tokens"`
+	// Tools is empty unless a session.update declares one; tool_choice always
+	// carries an effective value (default "auto") so no provider default is
+	// ever inherited.
+	Tools      []Tool     `json:"tools"`
+	ToolChoice ToolChoice `json:"tool_choice"`
+}
+
+// Tool is one function the model may call, in the flat GA session shape.
+// Parameters is an opaque JSON Schema object passed to the LLM provider
+// verbatim; Cascade never interprets it, and an absent Parameters means a
+// no-argument tool.
+type Tool struct {
+	Type        string          `json:"type"`
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
+}
+
+// ToolTypeFunction is the only tool type in the compatibility profile; MCP
+// tools are rejected.
+const ToolTypeFunction = "function"
+
+// Tool choice modes. ToolChoiceFunction is the object form and forces the
+// function named by ToolChoice.Name.
+const (
+	ToolChoiceAuto     = "auto"
+	ToolChoiceNone     = "none"
+	ToolChoiceRequired = "required"
+	ToolChoiceFunction = "function"
+)
+
+// ToolChoice is the GA union: one of the three mode strings, or a
+// {"type":"function","name":…} object. It round-trips to the form it names,
+// so the echoed session object matches what the client sent.
+type ToolChoice struct {
+	Mode string
+	Name string // set only when Mode is ToolChoiceFunction
+}
+
+// MarshalJSON renders the mode string, or the forced-function object.
+func (tc ToolChoice) MarshalJSON() ([]byte, error) {
+	if tc.Mode == ToolChoiceFunction {
+		return json.Marshal(struct {
+			Type string `json:"type"`
+			Name string `json:"name"`
+		}{Type: ToolChoiceFunction, Name: tc.Name})
+	}
+	mode := tc.Mode
+	if mode == "" {
+		mode = ToolChoiceAuto
+	}
+	return json.Marshal(mode)
+}
+
+// UnmarshalJSON accepts either form. Values are checked by Validate, not
+// here, so the error carries a dotted field path.
+func (tc *ToolChoice) UnmarshalJSON(b []byte) error {
+	var mode string
+	if err := json.Unmarshal(b, &mode); err == nil {
+		*tc = ToolChoice{Mode: mode}
+		return nil
+	}
+	var obj struct {
+		Type string `json:"type"`
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(b, &obj); err != nil {
+		return fmt.Errorf(`tool_choice must be a string or a {"type":"function","name":…} object`)
+	}
+	*tc = ToolChoice{Mode: obj.Type, Name: obj.Name}
+	return nil
 }
 
 // Audio mirrors session.audio.
@@ -212,12 +284,27 @@ func (td *TurnDetection) ApplyDefaults() {
 func (s SessionDefaults) Clone() SessionDefaults {
 	out := s
 	out.OutputModalities = append([]string(nil), s.OutputModalities...)
+	out.Tools = CloneTools(s.Tools)
 	if s.Audio.Input.Transcription != nil {
 		t := *s.Audio.Input.Transcription
 		out.Audio.Input.Transcription = &t
 	}
 	if s.Audio.Input.TurnDetection != nil {
 		out.Audio.Input.TurnDetection = s.Audio.Input.TurnDetection.Clone()
+	}
+	return out
+}
+
+// CloneTools returns a deep copy of a tool list. Parameters is opaque JSON,
+// so its bytes are copied rather than shared.
+func CloneTools(in []Tool) []Tool {
+	if in == nil {
+		return nil
+	}
+	out := make([]Tool, len(in))
+	for i, t := range in {
+		out[i] = t
+		out[i].Parameters = append(json.RawMessage(nil), t.Parameters...)
 	}
 	return out
 }

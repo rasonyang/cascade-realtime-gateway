@@ -36,12 +36,19 @@ const (
 	RoleAssistant Role = "assistant"
 )
 
-// ContentKind distinguishes text items from audio items.
+// ContentKind distinguishes text items from audio items and from the two
+// tool-invocation items.
 type ContentKind int
 
 const (
 	ContentText ContentKind = iota + 1
 	ContentAudio
+	// ContentToolCall is a function_call item the model produced: Name is the
+	// function, Text the raw arguments, CallID the provider's call id.
+	ContentToolCall
+	// ContentToolOutput is a function_call_output item the client created:
+	// Text is the opaque result and CallID links it to the call it answers.
+	ContentToolOutput
 )
 
 // ItemStatus follows the protocol item statuses.
@@ -65,13 +72,23 @@ type Item struct {
 	Text           string
 	AudioMs        int
 	TranscriptDone bool
+	// Name and CallID are set on the two tool items only. CallID is the LLM
+	// provider's own call id: it exists so history replay links a call to its
+	// result, and it is never serialized onto the wire — the protocol layer
+	// mints its own call id, as it does for item ids.
+	Name   string
+	CallID string
 }
 
-// ItemSpec describes a client-created text item.
+// ItemSpec describes a client-created item. Content defaults to ContentText;
+// ContentToolOutput carries a tool result, with CallItem naming the
+// function_call item it answers.
 type ItemSpec struct {
 	Role     Role
+	Content  ContentKind
 	Text     string
 	ClientID string
+	CallItem ItemRef
 }
 
 // ResponseStatus is the five-state protocol-aligned FSM.
@@ -117,6 +134,10 @@ type SessionPatch struct {
 	MaxOutputTokens  *config.MaxOutputTokens
 	Transcription    Nullable[config.Transcription]
 	TurnDetection    Nullable[config.TurnDetection]
+	// Tools and ToolChoice apply from the next response; a response already
+	// created is unaffected, exactly like Instructions.
+	Tools      []config.Tool
+	ToolChoice *config.ToolChoice
 }
 
 // ResponseOverrides is the internal form of response.create's per-response
@@ -288,6 +309,15 @@ type EvOutputAudioDelta struct {
 	PCM  []byte
 }
 
+// EvToolCallArguments states that a complete tool call has been delivered.
+// The call's name and id live on the item; the protocol layer projects this
+// one fact onto the arguments delta and done frames.
+type EvToolCallArguments struct {
+	Resp      ResponseRef
+	Item      ItemRef
+	Arguments string
+}
+
 type EvOutputTextDone struct {
 	Resp ResponseRef
 	Item ItemRef
@@ -339,6 +369,7 @@ func (EvOutputItemAdded) isEvent()            {}
 func (EvOutputTextDelta) isEvent()            {}
 func (EvOutputAudioTranscriptDelta) isEvent() {}
 func (EvOutputAudioDelta) isEvent()           {}
+func (EvToolCallArguments) isEvent()          {}
 func (EvOutputTextDone) isEvent()             {}
 func (EvOutputAudioTranscriptDone) isEvent()  {}
 func (EvOutputAudioDone) isEvent()            {}

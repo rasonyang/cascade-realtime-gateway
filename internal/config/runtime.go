@@ -61,6 +61,11 @@ type Profile struct {
 	Transcription *Transcription `json:"transcription"`
 	// TurnDetection nil (absent or null) is manual mode.
 	TurnDetection *TurnDetection `json:"turn_detection"`
+
+	// ToolChoice is the session default every new connection starts from.
+	// Tools themselves are declared per session through session.update, so a
+	// profile may not force a specific function (see validate).
+	ToolChoice ToolChoice `json:"tool_choice"`
 }
 
 // Settings holds the runtime knobs that are not per-profile.
@@ -85,6 +90,7 @@ func DefaultProfile() *Profile {
 		OutputModalities: []string{ModalityAudio},
 		Voice:            "alloy",
 		Speed:            1.0,
+		ToolChoice:       ToolChoice{Mode: ToolChoiceAuto},
 		Transcription:    &Transcription{},
 		TurnDetection: &TurnDetection{
 			Type:              TurnDetectionServerVAD,
@@ -102,6 +108,7 @@ func (p *Profile) SessionDefaults() SessionDefaults {
 		Instructions:     p.Instructions,
 		OutputModalities: slices.Clone(p.OutputModalities),
 		MaxOutputTokens:  p.MaxOutputTokens,
+		ToolChoice:       p.ToolChoice,
 		Audio: Audio{
 			Input: AudioInput{
 				Format:        AudioFormat{Type: AudioFormatPCM, Rate: AudioSampleRate},

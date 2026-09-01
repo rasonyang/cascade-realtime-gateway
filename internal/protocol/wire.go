@@ -1,6 +1,8 @@
 package protocol
 
 import (
+	"encoding/json"
+
 	"github.com/rasonyang/cascade-realtime-gateway/internal/config"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/session"
 )
@@ -81,11 +83,28 @@ type wireSession struct {
 	OutputModalities []string               `json:"output_modalities"`
 	Audio            wireAudio              `json:"audio"`
 	MaxOutputTokens  config.MaxOutputTokens `json:"max_output_tokens"`
-	Tools            []any                  `json:"tools"`
-	ToolChoice       string                 `json:"tool_choice"`
+	Tools            []wireTool             `json:"tools"`
+	ToolChoice       config.ToolChoice      `json:"tool_choice"`
 	Truncation       string                 `json:"truncation"`
 	Tracing          any                    `json:"tracing"`
 	Prompt           any                    `json:"prompt"`
+}
+
+// wireTool is the flat GA tool shape. Parameters is echoed exactly as the
+// client sent it.
+type wireTool struct {
+	Type        string          `json:"type"`
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
+}
+
+func toolObjects(tools []config.Tool) []wireTool {
+	out := make([]wireTool, 0, len(tools))
+	for _, t := range tools {
+		out = append(out, wireTool{Type: t.Type, Name: t.Name, Description: t.Description, Parameters: t.Parameters})
+	}
+	return out
 }
 
 func pcmFormat() wireFormat {
@@ -102,8 +121,8 @@ func sessionObject(id, model string, cfg config.SessionDefaults) wireSession {
 			Output: wireAudioOutput{Format: pcmFormat(), Voice: cfg.Audio.Output.Voice, Speed: cfg.Audio.Output.Speed},
 		},
 		MaxOutputTokens: cfg.MaxOutputTokens,
-		Tools:           []any{},
-		ToolChoice:      "auto",
+		Tools:           toolObjects(cfg.Tools),
+		ToolChoice:      cfg.ToolChoice,
 		Truncation:      "auto",
 	}
 	if tr := cfg.Audio.Input.Transcription; tr != nil {
@@ -195,6 +214,42 @@ type wireItem struct {
 	Content []any  `json:"content"`
 }
 
+// wireToolCallItem and wireToolOutputItem are the two tool item shapes. They
+// carry neither role nor content, so they are separate types rather than a
+// wireItem with empty fields.
+type wireToolCallItem struct {
+	ID        string `json:"id"`
+	Object    string `json:"object"`
+	Type      string `json:"type"`
+	Name      string `json:"name"`
+	CallID    string `json:"call_id"`
+	Arguments string `json:"arguments"`
+	Status    string `json:"status"`
+}
+
+type wireToolOutputItem struct {
+	ID     string `json:"id"`
+	Object string `json:"object"`
+	Type   string `json:"type"`
+	CallID string `json:"call_id"`
+	Output string `json:"output"`
+	Status string `json:"status"`
+}
+
+// anyItem projects an item onto whichever of the three shapes it is. callID
+// is the wire call id minted by the adapter; it is empty for messages.
+func anyItem(id, callID string, it session.Item) any {
+	switch it.Content {
+	case session.ContentToolCall:
+		return wireToolCallItem{ID: id, Object: objectItem, Type: "function_call",
+			Name: it.Name, CallID: callID, Arguments: it.Text, Status: string(it.Status)}
+	case session.ContentToolOutput:
+		return wireToolOutputItem{ID: id, Object: objectItem, Type: "function_call_output",
+			CallID: callID, Output: it.Text, Status: string(it.Status)}
+	}
+	return itemObject(id, it)
+}
+
 func itemObject(id string, it session.Item) wireItem {
 	w := wireItem{ID: id, Object: objectItem, Type: "message", Role: string(it.Role), Status: string(it.Status)}
 	switch {
@@ -217,8 +272,8 @@ func itemObject(id string, it session.Item) wireItem {
 
 type itemEvent struct {
 	base
-	PreviousItemID *string  `json:"previous_item_id"`
-	Item           wireItem `json:"item"`
+	PreviousItemID *string `json:"previous_item_id"`
+	Item           any     `json:"item"`
 }
 
 type itemIDEvent struct {
@@ -311,7 +366,7 @@ type wireResponse struct {
 	Object           string                 `json:"object"`
 	Status           string                 `json:"status"`
 	StatusDetails    *wireStatusDetails     `json:"status_details"`
-	Output           []wireItem             `json:"output"`
+	Output           []any                  `json:"output"`
 	Usage            *wireUsage             `json:"usage"`
 	ConversationID   string                 `json:"conversation_id"`
 	OutputModalities []string               `json:"output_modalities"`
@@ -327,9 +382,22 @@ type responseEvent struct {
 
 type outputItemEvent struct {
 	base
-	ResponseID  string   `json:"response_id"`
-	OutputIndex int      `json:"output_index"`
-	Item        wireItem `json:"item"`
+	ResponseID  string `json:"response_id"`
+	OutputIndex int    `json:"output_index"`
+	Item        any    `json:"item"`
+}
+
+// toolArgumentsEvent is response.function_call_arguments.delta (with Delta)
+// and .done (with Name and Arguments).
+type toolArgumentsEvent struct {
+	base
+	ResponseID  string `json:"response_id"`
+	ItemID      string `json:"item_id"`
+	OutputIndex int    `json:"output_index"`
+	CallID      string `json:"call_id"`
+	Delta       string `json:"delta,omitempty"`
+	Name        string `json:"name,omitempty"`
+	Arguments   string `json:"arguments,omitempty"`
 }
 
 type wireContentPart struct {

@@ -229,7 +229,7 @@ func serverVAD(create, interrupt bool) func(*session.Options) {
 
 // ---- normalization for golden traces --------------------------------------
 
-var idRe = regexp.MustCompile(`^(sess|conv|item|resp)_[a-z0-9]{16}$|^(event)_[a-z0-9]{12}$`)
+var idRe = regexp.MustCompile(`^(sess|conv|item|resp|call)_[a-z0-9]{16}$|^(event)_[a-z0-9]{12}$`)
 
 // normalizer rewrites server-generated ids to <prefix:n> in first-seen order
 // so traces are stable across runs.

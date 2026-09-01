@@ -42,6 +42,8 @@ type Adapter struct {
 
 	items    map[session.ItemRef]*itemState
 	itemByID map[string]session.ItemRef
+	callByID map[string]session.ItemRef // wire call id → function_call item
+	callWire map[string]string          // session (provider) call id → wire call id
 	resps    map[session.ResponseRef]*respState
 	respByID map[string]session.ResponseRef
 }
@@ -50,6 +52,11 @@ type itemState struct {
 	id      string
 	prev    *string
 	audioMs int
+	// callID is the wire call id of a tool item. It is minted here rather
+	// than taken from the LLM provider's own id, which must never reach the
+	// client, and it is what a function_call_output refers back to.
+	callID string
+	name   string
 }
 
 type respState struct {
@@ -60,6 +67,25 @@ type respState struct {
 	voice     string
 	maxTokens config.MaxOutputTokens
 	metadata  map[string]string
+	// outputIndex counts the response's output items: the message item is 0
+	// and a function_call after it is 1, so it is no longer always 0.
+	outputIndex map[session.ItemRef]int
+	nextIndex   int
+}
+
+// index returns the output index of ref within the response, assigning the
+// next one on first sight.
+func (rs *respState) index(ref session.ItemRef) int {
+	if i, ok := rs.outputIndex[ref]; ok {
+		return i
+	}
+	if rs.outputIndex == nil {
+		rs.outputIndex = map[session.ItemRef]int{}
+	}
+	i := rs.nextIndex
+	rs.outputIndex[ref] = i
+	rs.nextIndex++
+	return i
 }
 
 // New builds an adapter; SessionID and the conversation id are generated
@@ -74,6 +100,8 @@ func New(opts Options) *Adapter {
 		eventPrefix: newID("")[:6],
 		items:       map[session.ItemRef]*itemState{},
 		itemByID:    map[string]session.ItemRef{},
+		callByID:    map[string]session.ItemRef{},
+		callWire:    map[string]string{},
 		resps:       map[session.ResponseRef]*respState{},
 		respByID:    map[string]session.ResponseRef{},
 	}
@@ -190,6 +218,14 @@ func (a *Adapter) dispatch(env envelope) *wireErr {
 		}
 		cmd := session.CmdCreateItem{Meta: meta, Item: ic.spec}
 		a.mu.Lock()
+		if ic.callID != "" {
+			ref, ok := a.callByID[ic.callID]
+			if !ok {
+				a.mu.Unlock()
+				return invalidValue("item.call_id", fmt.Sprintf("No function_call with call_id '%s' exists.", ic.callID))
+			}
+			cmd.Item.CallItem = ref
+		}
 		if ic.spec.ClientID != "" {
 			if _, dup := a.itemByID[ic.spec.ClientID]; dup {
 				a.mu.Unlock()
@@ -303,11 +339,11 @@ func (a *Adapter) Outbound(ev session.Event) [][]byte {
 		st := a.itemFor(e.Item)
 		st.prev = a.optID(e.PreviousItem)
 		st.audioMs = e.Item.AudioMs
-		return frames(itemEvent{base: a.base("conversation.item.added"), PreviousItemID: st.prev, Item: itemObject(st.id, e.Item)})
+		return frames(itemEvent{base: a.base("conversation.item.added"), PreviousItemID: st.prev, Item: a.itemBody(st, e.Item)})
 	case session.EvItemDone:
 		st := a.itemFor(e.Item)
 		st.audioMs = e.Item.AudioMs
-		return frames(itemEvent{base: a.base("conversation.item.done"), PreviousItemID: st.prev, Item: itemObject(st.id, e.Item)})
+		return frames(itemEvent{base: a.base("conversation.item.done"), PreviousItemID: st.prev, Item: a.itemBody(st, e.Item)})
 	case session.EvItemDeleted:
 		st := a.item(e.ID)
 		delete(a.items, e.ID)
@@ -324,7 +360,8 @@ func (a *Adapter) Outbound(ev session.Event) [][]byte {
 			Usage: transcriptUsage{Type: "duration", Seconds: float64(st.audioMs) / 1000},
 		})
 	case session.EvResponseCreated:
-		st := &respState{id: newID("resp_"), modal: e.OutputModalities, voice: e.Voice, maxTokens: e.MaxOutputTokens, metadata: e.Metadata}
+		st := &respState{id: newID("resp_"), modal: e.OutputModalities, voice: e.Voice, maxTokens: e.MaxOutputTokens,
+			metadata: e.Metadata, outputIndex: map[session.ItemRef]int{}}
 		st.textOnly = len(e.OutputModalities) == 1 && e.OutputModalities[0] == config.ModalityText
 		a.resps[e.Resp] = st
 		a.respByID[st.id] = e.Resp
@@ -334,16 +371,38 @@ func (a *Adapter) Outbound(ev session.Event) [][]byte {
 		rs := a.resps[e.Resp]
 		st := a.itemFor(e.Item)
 		st.prev = a.optID(e.PreviousItem)
+		idx := rs.index(e.Item.Ref)
+		item := a.itemBody(st, e.Item)
+		if e.Item.Content == session.ContentToolCall {
+			// A function_call item has no content parts.
+			return frames(
+				outputItemEvent{base: a.base("response.output_item.added"), ResponseID: rs.id, OutputIndex: idx, Item: item},
+				itemEvent{base: a.base("conversation.item.added"), PreviousItemID: st.prev, Item: item},
+			)
+		}
 		rs.itemID = st.id
-		item := itemObject(st.id, e.Item)
 		part := wireContentPart{Type: "audio", Transcript: ptr("")}
 		if rs.textOnly {
 			part = wireContentPart{Type: "text", Text: ptr("")}
 		}
 		return frames(
-			outputItemEvent{base: a.base("response.output_item.added"), ResponseID: rs.id, Item: item},
+			outputItemEvent{base: a.base("response.output_item.added"), ResponseID: rs.id, OutputIndex: idx, Item: item},
 			itemEvent{base: a.base("conversation.item.added"), PreviousItemID: st.prev, Item: item},
-			contentPartEvent{base: a.base("response.content_part.added"), ResponseID: rs.id, ItemID: st.id, Part: part},
+			contentPartEvent{base: a.base("response.content_part.added"), ResponseID: rs.id, ItemID: st.id,
+				OutputIndex: idx, Part: part},
+		)
+	case session.EvToolCallArguments:
+		rs := a.resps[e.Resp]
+		st := a.item(e.Item)
+		idx := rs.index(e.Item)
+		// One delta carrying the complete arguments, then done: fragments are
+		// normalized away at the provider boundary, so there is nothing to
+		// stream (docs/protocol-profile.md §6).
+		return frames(
+			toolArgumentsEvent{base: a.base("response.function_call_arguments.delta"), ResponseID: rs.id,
+				ItemID: st.id, OutputIndex: idx, CallID: st.callID, Delta: e.Arguments},
+			toolArgumentsEvent{base: a.base("response.function_call_arguments.done"), ResponseID: rs.id,
+				ItemID: st.id, OutputIndex: idx, CallID: st.callID, Name: st.name, Arguments: e.Arguments},
 		)
 	case session.EvOutputTextDelta:
 		return frames(a.delta("response.output_text.delta", e.Resp, e.Item, e.Delta))
@@ -360,21 +419,31 @@ func (a *Adapter) Outbound(ev session.Event) [][]byte {
 	case session.EvOutputItemDone:
 		rs := a.resps[e.Resp]
 		st := a.itemFor(e.Item)
-		item := itemObject(st.id, e.Item)
+		idx := rs.index(e.Item.Ref)
+		item := a.itemBody(st, e.Item)
+		// Event ids are assigned in emission order, so each frame is built
+		// where it is sent, not ahead of it.
+		if e.Item.Content == session.ContentToolCall {
+			return frames(
+				outputItemEvent{base: a.base("response.output_item.done"), ResponseID: rs.id, OutputIndex: idx, Item: item},
+				itemEvent{base: a.base("conversation.item.done"), PreviousItemID: st.prev, Item: item},
+			)
+		}
 		part := wireContentPart{Type: "audio", Transcript: ptr(e.Item.Text)}
 		if rs.textOnly {
 			part = wireContentPart{Type: "text", Text: ptr(e.Item.Text)}
 		}
 		return frames(
-			contentPartEvent{base: a.base("response.content_part.done"), ResponseID: rs.id, ItemID: st.id, Part: part},
-			outputItemEvent{base: a.base("response.output_item.done"), ResponseID: rs.id, Item: item},
+			contentPartEvent{base: a.base("response.content_part.done"), ResponseID: rs.id, ItemID: st.id,
+				OutputIndex: idx, Part: part},
+			outputItemEvent{base: a.base("response.output_item.done"), ResponseID: rs.id, OutputIndex: idx, Item: item},
 			itemEvent{base: a.base("conversation.item.done"), PreviousItemID: st.prev, Item: item},
 		)
 	case session.EvResponseDone:
 		rs := a.resps[e.Resp]
-		var output []wireItem
+		var output []any
 		for _, it := range e.Output {
-			output = append(output, itemObject(a.itemFor(it).id, it))
+			output = append(output, a.itemBody(a.itemFor(it), it))
 		}
 		usage := wireUsage{TotalTokens: e.Usage.InputTokens + e.Usage.OutputTokens, InputTokens: e.Usage.InputTokens, OutputTokens: e.Usage.OutputTokens}
 		usage.InputTokenDetails.TextTokens = e.Usage.InputTokens
@@ -399,6 +468,25 @@ func ptr[T any](v T) *T { return &v }
 
 func (a *Adapter) delta(typ string, resp session.ResponseRef, item session.ItemRef, delta string) outputDeltaEvent {
 	return outputDeltaEvent{base: a.base(typ), ResponseID: a.resps[resp].id, ItemID: a.item(item).id, Delta: delta}
+}
+
+// itemBody renders an item, minting the wire call id the first time a tool
+// call is seen. The LLM provider's own call id never leaves the session: it
+// is only the key that links a result back to the call it answers, so the
+// function_call_output echoes the same wire id as its call.
+func (a *Adapter) itemBody(st *itemState, it session.Item) any {
+	if st.callID == "" && (it.Content == session.ContentToolCall || it.Content == session.ContentToolOutput) {
+		wire, ok := a.callWire[it.CallID]
+		if !ok {
+			wire = newID("call_")
+			a.callWire[it.CallID] = wire
+		}
+		if it.Content == session.ContentToolCall {
+			a.callByID[wire] = it.Ref
+		}
+		st.callID, st.name = wire, it.Name
+	}
+	return anyItem(st.id, st.callID, it)
 }
 
 // item returns the state for ref, allocating a server id on first sight.
@@ -434,9 +522,9 @@ func (a *Adapter) optID(ref session.ItemRef) *string {
 	return &id
 }
 
-func (a *Adapter) responseObject(rs *respState, status session.ResponseStatus, details *wireStatusDetails, output []wireItem, usage *wireUsage) wireResponse {
+func (a *Adapter) responseObject(rs *respState, status session.ResponseStatus, details *wireStatusDetails, output []any, usage *wireUsage) wireResponse {
 	if output == nil {
-		output = []wireItem{}
+		output = []any{}
 	}
 	r := wireResponse{
 		ID: rs.id, Object: objectResponse, Status: string(status), StatusDetails: details, Output: output, Usage: usage,

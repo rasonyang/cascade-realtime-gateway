@@ -56,6 +56,7 @@ Iron rules:
 - Speech-start detection (the interrupt trigger) uses the engine's own acoustic VAD ahead of ASR and does not depend on the ASR vendor. Under `semantic_vad`, end-of-turn consumes ASR transcripts; this is an approximation and is recorded in `docs/decisions.md`.
 - Cascade timing: Trigger emits `response.created` immediately, but the LLM must not start until the ASR Final for that turn's user item arrives (the `awaiting` phase). Commit calls `Finalize()` on the ASR stream to shorten the wait; on timeout, use the Partial if one exists, otherwise fail the response.
 - Providers report facts only; they never mutate session state directly.
+- Tools are executed by the client, never by the gateway: it forwards the call, accepts the result as an opaque string, and feeds it into the next generation, interpreting no tool semantics. `pipeToolCall` is the single delivery path — the actor commits the `function_call` item and emits its whole lifecycle on receipt, and a tool call never reaches the sentencer, so TTS can never speak arguments. The assistant message item is created lazily on the first text delta, so a call-only turn emits no empty message item. A delivered call is never retracted by a later cancel.
 - After an interrupt, wait for the client's `conversation.item.truncate` with `audio_end_ms` and trim the item so the next turn's context contains only what the user actually heard. Cascaded TTS has no exact text↔audio alignment; text trimming is approximated by capability tier (provider alignment > per-sentence proportional > whole-response proportional), documented in `docs/decisions.md`.
 - Distinguish generated / sent / played audio; played is known only via truncate reports.
 
@@ -68,6 +69,7 @@ Iron rules:
 ## Providers
 
 - Three narrow interfaces: ASR (session-scoped long stream, with `Finalize` and an EndOfTurn event), LLM (request-scoped unidirectional stream), TTS (streaming audio output is mandatory; incremental text input and character alignment are optional capabilities — providers without them are downgraded to per-sentence requests inside their adapter). ctx is the only cancellation mechanism.
+- Tool-call argument fragments are accumulated **inside the adapter**, which emits one complete `LLMToolCall` chunk before `LLMDone`; the session never sees a partial call. Cancelling or truncating mid-arguments therefore delivers no call at all. At most one call per response: a provider returning more is a `provider.Error`, never a silent drop. `tool_choice` is always sent explicitly, but the tool fields are serialized only alongside a non-empty `tools` array.
 - Plain interfaces plus a registry map. No plugin or reflection system. A provider *instance* is a named (type, api_key, options) triple in the runtime config; a *type* is a registry entry, and the roles it is registered for decide which profile slots may reference it.
 - Provider specifics are normalized at the boundary and must never leak into the protocol layer.
 
@@ -91,12 +93,12 @@ Configuration is split in two, by lifetime:
 - The state file wins when it exists; `bootstrap` is applied only on a first start, and is persisted immediately. A state file that cannot be read, decoded, validated or built is a startup failure, never a silent fallback.
 - Validation is shared with the session/protocol layers, not duplicated: unknown provider type → 400, profile referencing a missing instance → 400, provider that does not fill the role → 400, unknown `default_profile` → 400, deleting a referenced resource → 409. Every error names a dotted field path.
 - Secrets: `api_key` is a literal or `{env.X}`, stored verbatim; every read returns `"***"`; writing `"***"` back keeps the stored secret. Secrets never reach logs or the Recorder, and request bodies are never logged.
-- A profile's JSON shape is flat (`instructions`, `temperature`, `max_output_tokens`, `output_modalities`, `voice`, `speed`, `asr_language`, `asr_model`, `transcription`, `turn_detection`); `temperature` is nullable and unset by default, so nothing is sent unless a profile asks for it — that is the Admin resource model, not the GA session object. `Profile.SessionDefaults()` projects it onto the GA-shaped snapshot the session and protocol layers consume; audio formats are fixed constants.
+- A profile's JSON shape is flat (`instructions`, `temperature`, `max_output_tokens`, `output_modalities`, `voice`, `speed`, `asr_language`, `asr_model`, `transcription`, `turn_detection`, `tool_choice`); `temperature` is nullable and unset by default, so nothing is sent unless a profile asks for it — that is the Admin resource model, not the GA session object. `Profile.SessionDefaults()` projects it onto the GA-shaped snapshot the session and protocol layers consume; audio formats are fixed constants.
 - Without a `default_profile` the gateway starts and refuses new `/v1/realtime` connections with 503.
 - A Session takes a configuration snapshot when the connection opens; later Admin writes affect only later sessions.
 - The Admin API is guarded by `ADMIN_API_KEY` (Bearer), a credential distinct from `REALTIME_API_KEY`; unset disables the Admin API entirely. Bind `admin.listen` to localhost or a private network.
 - Provider-specific options are nested free-form blocks (json.RawMessage) parsed and validated by each provider adapter; they never leak into the generic interfaces.
-- The Realtime protocol is unchanged by any of this: `?model=` stays accept-and-echo and `session.update` gains no fields.
+- The Realtime protocol is unchanged by any of this: `?model=` stays accept-and-echo. (`session.update` gained `tools` / `tool_choice` in Phase 7, which is the one deliberate exception.) A profile carries the `tool_choice` default (`"auto"`) but declares no tools, so it may not force a specific function.
 
 ## State and persistence
 

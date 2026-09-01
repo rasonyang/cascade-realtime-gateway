@@ -20,7 +20,6 @@ type pipeline struct {
 	ctx  context.Context
 	gen  Generation
 	resp ResponseRef
-	item ItemRef
 
 	textOnly bool
 	req      provider.ChatRequest
@@ -70,11 +69,13 @@ func (p *pipeline) llmStage(chunks chan<- string) {
 	for c := range stream {
 		switch c.Kind {
 		case provider.LLMTextDelta:
+			// The item ref is left unset: the actor creates the message item
+			// lazily on the first delta and fills it in before emitting.
 			var ev Event
 			if p.textOnly {
-				ev = EvOutputTextDelta{Resp: p.resp, Item: p.item, Gen: p.gen, Delta: c.Text}
+				ev = EvOutputTextDelta{Resp: p.resp, Gen: p.gen, Delta: c.Text}
 			} else {
-				ev = EvOutputAudioTranscriptDelta{Resp: p.resp, Item: p.item, Gen: p.gen, Delta: c.Text}
+				ev = EvOutputAudioTranscriptDelta{Resp: p.resp, Gen: p.gen, Delta: c.Text}
 			}
 			if !p.send(ev) {
 				return
@@ -82,6 +83,12 @@ func (p *pipeline) llmStage(chunks chan<- string) {
 			select {
 			case chunks <- c.Text:
 			case <-p.ctx.Done():
+				return
+			}
+		case provider.LLMToolCall:
+			// A tool call is never written to chunks, so the sentencer never
+			// sees it and TTS can never speak JSON arguments.
+			if !p.send(pipeToolCall{Gen: p.gen, Call: c.ToolCall}) {
 				return
 			}
 		case provider.LLMDone:
@@ -244,7 +251,7 @@ func (p *pipeline) drain(stream provider.TTSStream) (int, bool) {
 		if p.firstAudioMs < 0 {
 			p.firstAudioMs = time.Since(started).Milliseconds()
 		}
-		if !p.send(EvOutputAudioDelta{Resp: p.resp, Item: p.item, Gen: p.gen, PCM: pcm}) {
+		if !p.send(EvOutputAudioDelta{Resp: p.resp, Gen: p.gen, PCM: pcm}) {
 			return total, false
 		}
 		total += len(pcm)

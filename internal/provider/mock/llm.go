@@ -21,6 +21,16 @@ type LLMScript struct {
 	BlockAfter   int                   `json:"block_after"`
 	Err          error                 `json:"-"`
 	ChatErr      error                 `json:"-"`
+
+	// ToolCall, when set, is emitted as one complete call after every token
+	// and before Done — the shape a real adapter produces once it has
+	// accumulated the argument fragments. An empty Tokens list therefore
+	// scripts a call-only turn, and a non-empty one a text+call turn.
+	ToolCall *provider.ToolCall `json:"-"`
+	// BlockAfterToolCall blocks until ctx is cancelled once the call has been
+	// delivered, which is how "cancelled after a delivered call" is scripted.
+	// Block with BlockAfter inside Tokens covers the opposite case.
+	BlockAfterToolCall bool `json:"-"`
 }
 
 // LLM is the mock provider. It records every request and the moment a
@@ -40,10 +50,23 @@ type LLM struct {
 
 // NewLLM builds the provider.
 func NewLLM(s LLMScript) *LLM {
+	return &LLM{script: normalizeScript(s)}
+}
+
+func normalizeScript(s LLMScript) LLMScript {
 	if s.FinishReason == "" {
 		s.FinishReason = provider.FinishStop
 	}
-	return &LLM{script: s}
+	return s
+}
+
+// SetScript replaces the script used by subsequent generations, so a test can
+// script a second turn differently from the first — a tool call answered by a
+// spoken reply, for instance.
+func (l *LLM) SetScript(s LLMScript) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.script = normalizeScript(s)
 }
 
 // Kind implements provider.Provider.
@@ -75,19 +98,23 @@ func (l *LLM) Chat(ctx context.Context, req provider.ChatRequest) (<-chan provid
 	if l.OnChat != nil {
 		l.OnChat(req)
 	}
-	if l.script.ChatErr != nil {
-		return nil, l.script.ChatErr
+	l.mu.Lock()
+	chatErr := l.script.ChatErr
+	l.mu.Unlock()
+	if chatErr != nil {
+		return nil, chatErr
 	}
 	l.mu.Lock()
 	l.requests = append(l.requests, req)
 	l.active++
+	script := l.script
 	l.mu.Unlock()
 	out := make(chan provider.LLMChunk, llmChunkQueue)
-	go l.generate(ctx, out)
+	go l.generate(ctx, out, script)
 	return out, nil
 }
 
-func (l *LLM) generate(ctx context.Context, out chan<- provider.LLMChunk) {
+func (l *LLM) generate(ctx context.Context, out chan<- provider.LLMChunk, script LLMScript) {
 	defer close(out)
 	defer func() {
 		l.mu.Lock()
@@ -112,12 +139,12 @@ func (l *LLM) generate(ctx context.Context, out chan<- provider.LLMChunk) {
 		default:
 		}
 	}
-	for i, tok := range l.script.Tokens {
-		if l.script.Block && i == l.script.BlockAfter {
+	for i, tok := range script.Tokens {
+		if script.Block && i == script.BlockAfter {
 			block()
 			return
 		}
-		if d := time.Duration(l.script.TokenDelay); d > 0 {
+		if d := time.Duration(script.TokenDelay); d > 0 {
 			select {
 			case <-time.After(d):
 			case <-ctx.Done():
@@ -129,15 +156,24 @@ func (l *LLM) generate(ctx context.Context, out chan<- provider.LLMChunk) {
 			return
 		}
 	}
-	if l.script.Block && l.script.BlockAfter >= len(l.script.Tokens) {
+	if script.Block && script.BlockAfter >= len(script.Tokens) {
 		block()
 		return
 	}
-	if l.script.Err != nil {
-		send(provider.LLMChunk{Kind: provider.LLMError, Err: l.script.Err})
+	if tc := script.ToolCall; tc != nil {
+		if !send(provider.LLMChunk{Kind: provider.LLMToolCall, ToolCall: *tc}) {
+			return
+		}
+		if script.BlockAfterToolCall {
+			block()
+			return
+		}
+	}
+	if script.Err != nil {
+		send(provider.LLMChunk{Kind: provider.LLMError, Err: script.Err})
 		return
 	}
-	send(provider.LLMChunk{Kind: provider.LLMDone, FinishReason: l.script.FinishReason, Usage: l.script.Usage})
+	send(provider.LLMChunk{Kind: provider.LLMDone, FinishReason: script.FinishReason, Usage: script.Usage})
 }
 
 func (l *LLM) markCancelled() {

@@ -150,3 +150,82 @@ func TestInvariantsFatalErrorHasNoClientEventID(t *testing.T) {
 		t.Fatalf("fatal error frame = %v", f)
 	}
 }
+
+// TestInvariantsAudioToolCall covers the audio-mode text+call turn, whose
+// transcript and audio streams interleave non-deterministically and are
+// therefore checked against causal invariants only, not a golden trace.
+func TestInvariantsAudioToolCall(t *testing.T) {
+	r := newRig(t, toolScripts("Let me check", " that for you."), "", manual)
+	r.send(`{"type":"session.update","event_id":"s1","session":{"type":"realtime","tools":[{"type":"function","name":"transfer_to_agent"}]}}`)
+	r.waitType("session.updated")
+	r.send(`{"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"sales please"}]}}`)
+	r.waitType("conversation.item.done")
+	r.send(`{"type":"response.create","event_id":"c1"}`)
+	r.waitType("response.done")
+	frames := r.all()
+	assertMonotonicEventIDs(t, frames)
+
+	if r.count("response.output_audio.delta") == 0 {
+		t.Fatalf("no audio was produced; the assertions below would be vacuous: %v", r.types())
+	}
+
+	// The arguments events sit inside the function_call item's lifecycle,
+	// which is itself at output_index 1, after the message item.
+	callAdded, callDone := -1, -1
+	argsDelta, argsDone, respDone := -1, -1, -1
+	for i, f := range frames {
+		item, _ := f.get("item").(map[string]any)
+		isCall := item != nil && item["type"] == "function_call"
+		switch {
+		case f.typ() == "response.output_item.added" && isCall:
+			callAdded = i
+			if f.get("output_index") != float64(1) {
+				t.Errorf("function_call output_index = %v, want 1 after the message item", f.get("output_index"))
+			}
+		case f.typ() == "response.output_item.done" && isCall:
+			callDone = i
+		case f.typ() == "response.function_call_arguments.delta":
+			argsDelta = i
+		case f.typ() == "response.function_call_arguments.done":
+			argsDone = i
+		case f.typ() == "response.done":
+			respDone = i
+		}
+	}
+	if callAdded < 0 || argsDelta < 0 || argsDone < 0 || callDone < 0 || respDone < 0 {
+		t.Fatalf("missing tool frames: %v", r.types())
+	}
+	if !(callAdded < argsDelta && argsDelta < argsDone && argsDone < callDone) {
+		t.Fatalf("arguments events outside the item lifecycle: added=%d delta=%d done=%d itemDone=%d",
+			callAdded, argsDelta, argsDone, callDone)
+	}
+	if argsDone > respDone {
+		t.Fatal("arguments.done after response.done")
+	}
+	// No arguments event may follow the response's terminal frame.
+	for i, f := range frames {
+		if i > respDone && strings.HasPrefix(f.typ(), "response.function_call_arguments.") {
+			t.Fatalf("%s after response.done", f.typ())
+		}
+	}
+
+	// A function_call item has no content parts, and the arguments never
+	// reach the spoken transcript or the audio stream.
+	var transcript string
+	for _, f := range frames {
+		if f.typ() == "response.output_audio_transcript.delta" || f.typ() == "response.output_audio_transcript.done" {
+			transcript += f.str("delta") + f.str("transcript")
+		}
+		if strings.HasPrefix(f.typ(), "response.content_part.") && f.get("output_index") == float64(1) {
+			t.Fatalf("a function_call item must have no content parts: %v", f)
+		}
+	}
+	for _, fragment := range []string{"department", "sales", "{", "}", "transfer_to_agent"} {
+		if strings.Contains(transcript, fragment) {
+			t.Fatalf("tool-call text %q reached the spoken transcript %q", fragment, transcript)
+		}
+	}
+	if transcript == "" {
+		t.Fatal("no transcript; the assertion above would be vacuous")
+	}
+}

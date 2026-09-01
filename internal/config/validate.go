@@ -1,6 +1,8 @@
 package config
 
 import (
+	"encoding/json"
+	"fmt"
 	"slices"
 	"strings"
 )
@@ -139,6 +141,15 @@ func (p *Profile) validate(field, key string) error {
 	if p.Voice == "" {
 		return fieldErrorf(field+".voice", "must not be empty")
 	}
+	switch p.ToolChoice.Mode {
+	case ToolChoiceAuto, ToolChoiceNone, ToolChoiceRequired:
+	case ToolChoiceFunction:
+		// A profile declares no tools, so a forced function could never name
+		// one; tools arrive through session.update.
+		return fieldErrorf(field+".tool_choice", "a forced function is not configurable on a profile; tools are declared per session")
+	default:
+		return fieldErrorf(field+".tool_choice", `must be "auto", "none" or "required", got %q`, p.ToolChoice.Mode)
+	}
 	if t := p.Temperature; t != nil && (*t < TemperatureMin || *t > TemperatureMax) {
 		return fieldErrorf(field+".temperature", "must be within [%g, %g], got %g",
 			TemperatureMin, TemperatureMax, *t)
@@ -182,7 +193,62 @@ func (s *SessionDefaults) Validate(prefix string) error {
 	if err := validateSpeed(prefix+".audio.output.speed", s.Audio.Output.Speed); err != nil {
 		return err
 	}
+	if err := validateTools(prefix+".tools", s.Tools); err != nil {
+		return err
+	}
+	if err := validateToolChoice(prefix+".tool_choice", s.ToolChoice, s.Tools); err != nil {
+		return err
+	}
 	return validateMaxOutputTokens(prefix+".max_output_tokens", s.MaxOutputTokens)
+}
+
+// validateTools checks the tool array. Parameters is opaque, but it must be a
+// JSON object: everything else would be rejected by the provider anyway, and
+// far later.
+func validateTools(field string, tools []Tool) error {
+	seen := make(map[string]bool, len(tools))
+	for i, t := range tools {
+		at := fmt.Sprintf("%s[%d]", field, i)
+		if t.Type != ToolTypeFunction {
+			return fieldErrorf(at+".type", "only %q is supported, got %q", ToolTypeFunction, t.Type)
+		}
+		if t.Name == "" {
+			return fieldErrorf(at+".name", "must not be empty")
+		}
+		if seen[t.Name] {
+			return fieldErrorf(at+".name", "duplicate tool name %q", t.Name)
+		}
+		seen[t.Name] = true
+		if len(t.Parameters) > 0 && !isJSONObject(t.Parameters) {
+			return fieldErrorf(at+".parameters", "must be a JSON Schema object")
+		}
+	}
+	return nil
+}
+
+// validateToolChoice checks the union. A forced function must name a tool
+// that was actually declared, so the model can never be pointed at nothing.
+func validateToolChoice(field string, tc ToolChoice, tools []Tool) error {
+	switch tc.Mode {
+	case ToolChoiceAuto, ToolChoiceNone, ToolChoiceRequired, "":
+		return nil
+	case ToolChoiceFunction:
+		if !slices.ContainsFunc(tools, func(t Tool) bool { return t.Name == tc.Name }) {
+			return fieldErrorf(field+".name", "no tool named %q is declared", tc.Name)
+		}
+		return nil
+	}
+	return fieldErrorf(field, `must be "auto", "none", "required" or a {"type":"function","name":…} object, got %q`, tc.Mode)
+}
+
+// isJSONObject reports whether raw is a JSON object, ignoring leading space.
+func isJSONObject(raw json.RawMessage) bool {
+	var v any
+	if json.Unmarshal(raw, &v) != nil {
+		return false
+	}
+	_, ok := v.(map[string]any)
+	return ok
 }
 
 func validateModalities(field string, mods []string) error {

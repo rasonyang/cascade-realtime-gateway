@@ -9,7 +9,9 @@
 package qwen
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -357,4 +359,143 @@ func TestRealCascade(t *testing.T) {
 		t.Fatal("the answer was not spoken")
 	}
 	t.Logf("CASCADE spoken=%dms", audio.BytesToMs(spoken))
+}
+
+// TestRealLLMToolCall verifies DashScope's compatible-mode tool_calls
+// streaming shape against the live endpoint rather than assuming it matches
+// OpenAI's: the service has already deviated from its documentation twice
+// (reasoning_content in deltas, the TTS flush stall). It logs the raw
+// fragments, then asserts what the adapter normalizes them into.
+//
+// Scope: only tool_choice "auto" is live-verified in Phase 7 — the only mode
+// the gateway's consumer uses. The wire mapping of "none", "required" and a
+// forced function is covered by TestLLMToolChoiceModes / TestLLMForcedToolChoice
+// against the fake endpoint, and their behaviour on the live service is
+// therefore unverified.
+func TestRealLLMToolCall(t *testing.T) {
+	key := realKey(t)
+	tools := []provider.ToolDef{{
+		Name:        "transfer_to_agent",
+		Description: "Transfer the caller to a human agent in the named department.",
+		Parameters: json.RawMessage(`{"type":"object","properties":` +
+			`{"department":{"type":"string","description":"sales, support or billing"}},` +
+			`"required":["department"]}`),
+	}}
+	req := provider.ChatRequest{
+		Instructions: "You are a call-centre agent. Use the tools you are given; do not answer in prose.",
+		Messages:     []provider.Message{{Role: provider.RoleUser, Content: "Please put me through to the sales department."}},
+		Tools:        tools,
+		ToolChoice:   provider.ToolChoice{Mode: provider.ToolChoiceAuto},
+	}
+
+	// --- raw shape ---------------------------------------------------------
+	logRawToolStream(t, key, req)
+
+	// --- through the adapter -----------------------------------------------
+	ch, err := NewLLM(key, LLMOptions{}).Chat(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls []provider.ToolCall
+	var text strings.Builder
+	var last provider.LLMChunk
+	for c := range ch {
+		switch c.Kind {
+		case provider.LLMTextDelta:
+			text.WriteString(c.Text)
+		case provider.LLMToolCall:
+			calls = append(calls, c.ToolCall)
+		case provider.LLMError:
+			t.Fatalf("stream error: %v", c.Err)
+		}
+		last = c
+	}
+	if last.Kind != provider.LLMDone {
+		t.Fatalf("stream ended with %+v, want done", last)
+	}
+	if last.FinishReason != provider.FinishStop {
+		t.Errorf("finish reason = %q, want stop: a tool call is a completed turn", last.FinishReason)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("tool calls = %+v, want exactly one complete call", calls)
+	}
+	call := calls[0]
+	if call.Name != "transfer_to_agent" {
+		t.Errorf("call name = %q", call.Name)
+	}
+	if call.ID == "" {
+		t.Error("call id is empty; the wire fragments carry no id")
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
+		t.Fatalf("arguments %q are not valid JSON — fragment accumulation is wrong: %v", call.Arguments, err)
+	}
+	if args["department"] == nil {
+		t.Errorf("arguments = %v, want the department the caller asked for", args)
+	}
+	t.Logf("TOOL id=%q name=%q arguments=%s preamble=%q usage=%+v",
+		call.ID, call.Name, call.Arguments, text.String(), last.Usage)
+
+	// --- history replay ----------------------------------------------------
+	// The other direction: an assistant turn carrying tool_calls (with empty
+	// content) followed by a role:"tool" result must be accepted, and the
+	// model must answer in prose rather than calling again.
+	follow := req
+	follow.Messages = append(append([]provider.Message(nil), req.Messages...),
+		provider.Message{Role: provider.RoleAssistant, Content: text.String(), ToolCalls: []provider.ToolCall{call}},
+		provider.Message{Role: provider.RoleTool, ToolCallID: call.ID,
+			Content: "No sales agent is available. Tell the caller and offer to take a message."})
+	ch2, err := NewLLM(key, LLMOptions{}).Chat(context.Background(), follow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reply strings.Builder
+	var calls2 []provider.ToolCall
+	for c := range ch2 {
+		switch c.Kind {
+		case provider.LLMTextDelta:
+			reply.WriteString(c.Text)
+		case provider.LLMToolCall:
+			calls2 = append(calls2, c.ToolCall)
+		case provider.LLMError:
+			t.Fatalf("replay stream error: %v", c.Err)
+		}
+	}
+	if reply.Len() == 0 && len(calls2) == 0 {
+		t.Fatal("the tool result produced neither speech nor a further call")
+	}
+	t.Logf("REPLAY reply=%q calls=%+v", reply.String(), calls2)
+}
+
+// logRawToolStream issues the same request straight to the endpoint and logs
+// every data: line, so the wire shape is on the record rather than inferred
+// from the adapter's output.
+func logRawToolStream(t *testing.T, key string, req provider.ChatRequest) {
+	t.Helper()
+	l := NewLLM(key, LLMOptions{})
+	body := chatRequest{
+		Model: l.opts.Model, Stream: true, StreamOptions: streamOptions{IncludeUsage: true},
+		EnableThinking: false, Tools: chatTools(req.Tools),
+		ToolChoice: chatToolChoice(req.ToolChoice), ParallelToolCalls: new(bool),
+	}
+	body.Messages = append(body.Messages, chatMessage{Role: "system", Content: req.Instructions})
+	for _, m := range req.Messages {
+		body.Messages = append(body.Messages, chatMessageOf(m))
+	}
+	resp, err := l.post(context.Background(), body)
+	if err != nil {
+		t.Fatalf("raw probe: %v", err)
+	}
+	defer resp.Body.Close()
+	r := bufio.NewReader(resp.Body)
+	for n := 0; n < 200; n++ {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if strings.HasPrefix(line, "data:") {
+			t.Logf("RAW %s", strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
 }

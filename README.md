@@ -12,6 +12,32 @@ Clients connect to `ws://<listen>/v1/realtime?model=<any>` with `Authorization: 
 and speak the OpenAI Realtime GA protocol (`session.type = "realtime"`). Cascade serves plain WebSocket;
 put a TLS terminator in front of it for `wss://` (the official OpenAI SDKs require `wss:`).
 
+## Function calling
+
+Declare tools on the session and the model can call them; Cascade never executes one. It forwards the
+call, takes the result back as an opaque string, and feeds it into the next generation.
+
+```jsonc
+// session.update
+{"type":"session.update","session":{"type":"realtime",
+  "tools":[{"type":"function","name":"transfer_to_agent","description":"Hand off to a human.",
+            "parameters":{"type":"object","properties":{"department":{"type":"string"}},"required":["department"]}}],
+  "tool_choice":"auto"}}
+
+// ← response.function_call_arguments.done {call_id, name, arguments}
+// → the client executes the tool and returns its result, then asks for the next turn
+{"type":"conversation.item.create","item":{"type":"function_call_output",
+  "call_id":"call_…","output":"no agent available"}}
+{"type":"response.create"}
+```
+
+`tool_choice` is `"auto"` (the default), `"none"`, `"required"` or `{"type":"function","name":…}`.
+`arguments` arrives as one complete delta followed by `.done`, never as fragments — the fragments are
+reassembled at the provider boundary, which also means Cascade emits no `arguments.done` for a call
+that was cancelled or truncated mid-arguments. At most one call per response. `arguments` is a raw
+JSON string Cascade never parses, so a client must still handle a parse failure. The full rules,
+including every rejection's field path, are in `docs/protocol-profile.md`.
+
 Architecture rules live in `CLAUDE.md`; the implementation plan in `docs/implementation-brief.md`;
 the protocol compatibility profile in `docs/protocol-profile.md`.
 
@@ -133,6 +159,7 @@ CASCADE_E2E_LLM_MODEL=gpt-5-nano \
 
 # Qwen / Model Studio, real endpoints (network, billed)
 ALIYUN_API_KEY=... go test -tags qwenreal -v ./internal/provider/qwen        # provider behaviour
-ALIYUN_API_KEY=... go test -tags e2e -run TestE2EQwen -v ./internal/server   # Admin API → profile → voice turn
+ALIYUN_API_KEY=... go test -tags e2e -run TestE2EQwen -v ./internal/server   # Admin API → profile → voice turn,
+                                                                            # and function calling end to end
 ALIYUN_API_KEY=... go run ./hack/qwenbench -only e2e -turns 20               # gateway latency
 ```

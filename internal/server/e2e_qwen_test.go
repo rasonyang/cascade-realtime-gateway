@@ -250,6 +250,175 @@ turnDone:
 	t.Log("STEP 6  restart from the state file resolves the same profile and rebuilds the providers")
 }
 
+// TestE2EQwenToolCall drives function calling end to end on live providers,
+// through an Admin-configured profile: the model calls a tool, the test
+// returns a function_call_output the way a client would, and the second
+// response is spoken. This is the test that proves the whole path rather
+// than just the protocol layer.
+func TestE2EQwenToolCall(t *testing.T) {
+	if os.Getenv("ALIYUN_API_KEY") == "" {
+		t.Skip("ALIYUN_API_KEY not set")
+	}
+	capture := &logCapture{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(capture))
+	defer slog.SetDefault(prev)
+
+	store, err := admin.Open(admin.Options{
+		StateFile: filepath.Join(t.TempDir(), "state.json"), Known: provider.Known, Logger: slog.New(capture)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.DefaultConfig()
+	cfg.Auth.APIKey, cfg.Auth.AdminAPIKey = apiKey, adminKey
+	if err := cfg.Validate(provider.Known); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(Options{Config: cfg, Resolver: store, Logger: slog.New(capture)})
+	f := &fixture{t: t, srv: srv}
+	f.http = newHTTPServer(srv)
+	defer f.http.Close()
+	defer srv.Shutdown(context.Background())
+
+	adminAPI := store.Handler(adminKey)
+	admWrite := func(method, path, body string) (int, []byte) {
+		t.Helper()
+		req := httptest.NewRequest(method, admin.BasePath+path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+adminKey)
+		w := httptest.NewRecorder()
+		adminAPI.ServeHTTP(w, req)
+		return w.Code, w.Body.Bytes()
+	}
+	for _, p := range []struct{ name, role string }{{"qwen-asr", "asr"}, {"qwen-llm", "llm"}, {"qwen-tts", "tts"}} {
+		body := fmt.Sprintf(`{"name":%q,"type":"qwen","api_key":"{env.ALIYUN_API_KEY}"}`, p.name)
+		if code, b := admWrite("PUT", "/providers/"+p.name, body); code != http.StatusOK {
+			t.Fatalf("PUT provider %s = %d %s", p.name, code, b)
+		}
+	}
+	if code, b := admWrite("PUT", "/profiles/voice", `{"name":"voice","asr":"qwen-asr","llm":"qwen-llm","tts":"qwen-tts",
+	  "instructions":"You are a call-centre agent. Use the tools you are given rather than answering in prose.",
+	  "voice":"longanlingxi","asr_language":"en","turn_detection":null}`); code != http.StatusOK {
+		t.Fatalf("PUT profile = %d %s", code, b)
+	}
+	if code, b := admWrite("PUT", "/settings", `{"default_profile":"voice"}`); code != http.StatusOK {
+		t.Fatalf("PUT settings = %d %s", code, b)
+	}
+
+	c := f.connect()
+	c.timeout = 40 * time.Second
+	c.readUntil("session.created")
+	c.readUntil("conversation.created")
+
+	// ---- 1. Declare the tools, exactly as aicc does -------------------------
+	c.send(`{"type":"session.update","session":{"type":"realtime","tools":[
+	  {"type":"function","name":"transfer_to_agent","description":"Transfer the caller to a human agent.",
+	   "parameters":{"type":"object","properties":{"department":{"type":"string","description":"sales, support or billing"}},"required":["department"]}},
+	  {"type":"function","name":"hangup","description":"End the call.","parameters":{"type":"object","properties":{}}}
+	],"tool_choice":"auto"}}`)
+	updated := c.readUntil("session.updated")
+	sess := updated["session"].(map[string]any)
+	if tools, _ := sess["tools"].([]any); len(tools) != 2 {
+		t.Fatalf("tools echo = %v", sess["tools"])
+	}
+	if sess["tool_choice"] != "auto" {
+		t.Fatalf("tool_choice echo = %v", sess["tool_choice"])
+	}
+	t.Log("STEP 1  tools accepted and echoed")
+
+	// ---- 2. The model calls a tool ------------------------------------------
+	c.send(`{"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"Please put me through to the sales department."}]}}`)
+	c.readUntil("conversation.item.done")
+	c.send(`{"type":"response.create"}`)
+
+	var callID, callName, args, spoken string
+	for {
+		fr, err := c.read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch fr["type"].(string) {
+		case "error":
+			t.Fatalf("error: %v", fr["error"])
+		case "response.output_audio_transcript.delta":
+			spoken += fr["delta"].(string)
+		case "response.function_call_arguments.done":
+			callID, _ = fr["call_id"].(string)
+			callName, _ = fr["name"].(string)
+			args, _ = fr["arguments"].(string)
+		case "response.done":
+			r := fr["response"].(map[string]any)
+			if r["status"] != "completed" {
+				t.Fatalf("tool turn response.done = %v", r)
+			}
+			goto called
+		}
+	}
+called:
+	if callID == "" || callName != "transfer_to_agent" {
+		t.Fatalf("no transfer_to_agent call: id=%q name=%q spoken=%q", callID, callName, spoken)
+	}
+	if !strings.HasPrefix(callID, "call_") {
+		t.Errorf("call_id = %q; the provider's own id must not reach the client", callID)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		t.Fatalf("arguments %q are not valid JSON: %v", args, err)
+	}
+	if parsed["department"] == nil {
+		t.Errorf("arguments = %s, want the department the caller asked for", args)
+	}
+	// The spoken preamble, if any, must never contain the arguments.
+	for _, fragment := range []string{"department", "{", "}", "transfer_to_agent"} {
+		if strings.Contains(spoken, fragment) {
+			t.Fatalf("tool-call text reached the spoken transcript: %q", spoken)
+		}
+	}
+	t.Logf("STEP 2  call_id=%s name=%s arguments=%s preamble=%q", callID, callName, args, spoken)
+
+	// ---- 3. The client executes the tool and returns its result -------------
+	c.send(fmt.Sprintf(`{"type":"conversation.item.create","item":{"type":"function_call_output","call_id":%q,"output":"No sales agent is available. Tell the caller and offer to take a message."}}`, callID))
+	c.readUntil("conversation.item.done")
+	c.send(`{"type":"response.create"}`)
+
+	var reply string
+	audioBytes := 0
+	for {
+		fr, err := c.read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch fr["type"].(string) {
+		case "error":
+			t.Fatalf("error: %v", fr["error"])
+		case "response.output_audio.delta":
+			b, _ := base64.StdEncoding.DecodeString(fr["delta"].(string))
+			audioBytes += len(b)
+		case "response.output_audio_transcript.done":
+			reply = fr["transcript"].(string)
+		case "response.done":
+			r := fr["response"].(map[string]any)
+			if r["status"] != "completed" {
+				t.Fatalf("second response.done = %v", r)
+			}
+			goto answered
+		}
+	}
+answered:
+	if reply == "" || audioBytes == 0 {
+		t.Fatalf("the tool result produced no spoken answer: reply=%q audio=%d", reply, audioBytes)
+	}
+	t.Logf("STEP 3  reply=%q audio=%d ms", reply, audio.BytesToMs(audioBytes))
+
+	// ---- 4. A second result for the same call is rejected --------------------
+	c.send(fmt.Sprintf(`{"type":"conversation.item.create","event_id":"dup","item":{"type":"function_call_output","call_id":%q,"output":"again"}}`, callID))
+	e := c.readUntil("error")
+	werr := e["error"].(map[string]any)
+	if werr["code"] != "invalid_value" || werr["param"] != "item.call_id" {
+		t.Fatalf("duplicate output error = %v", werr)
+	}
+	t.Log("STEP 4  a duplicate function_call_output is rejected on item.call_id")
+}
+
 // synthesizeQwen speaks text with the real Qwen TTS so the ASR has genuine
 // 24 kHz audio to transcribe.
 func synthesizeQwen(t *testing.T, text string) []byte {

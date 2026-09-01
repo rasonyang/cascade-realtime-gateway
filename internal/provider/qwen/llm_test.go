@@ -373,3 +373,329 @@ func TestClassify(t *testing.T) {
 		}
 	}
 }
+
+// ---- tool calls ------------------------------------------------------------
+
+// toolFragment renders one delta.tool_calls fragment.
+func toolFragment(index int, id, name, args string) string {
+	call := map[string]any{"index": index, "function": map[string]any{"arguments": args}}
+	if id != "" {
+		call["id"] = id
+		call["type"] = "function"
+	}
+	if name != "" {
+		call["function"].(map[string]any)["name"] = name
+	}
+	b, _ := json.Marshal(map[string]any{
+		"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{call}}}},
+	})
+	return "data: " + string(b)
+}
+
+func toolFinish() string {
+	return `data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`
+}
+
+// collectCalls returns every tool call chunk in arrival order alongside the
+// full chunk list.
+func collectCalls(t *testing.T, ch <-chan provider.LLMChunk) ([]provider.ToolCall, []provider.LLMChunk) {
+	t.Helper()
+	var calls []provider.ToolCall
+	var all []provider.LLMChunk
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case c, ok := <-ch:
+			if !ok {
+				return calls, all
+			}
+			if c.Kind == provider.LLMToolCall {
+				calls = append(calls, c.ToolCall)
+			}
+			all = append(all, c)
+		case <-deadline:
+			t.Fatal("timed out collecting LLM chunks")
+		}
+	}
+}
+
+// TestLLMToolCallFragmentAccumulation: id and name arrive on the first
+// fragment only and arguments are split; the session must see one complete
+// call, before Done.
+func TestLLMToolCallFragmentAccumulation(t *testing.T) {
+	_, srv := newFakeChat(t,
+		toolFragment(0, "call_abc", "transfer_to_agent", `{"dep`),
+		toolFragment(0, "", "", `artment":"sa`),
+		toolFragment(0, "", "", `les"}`),
+		toolFinish(), "data: [DONE]")
+	ch, err := newTestLLM(srv.URL).Chat(context.Background(), provider.ChatRequest{
+		Tools: []provider.ToolDef{{Name: "transfer_to_agent"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls, all := collectCalls(t, ch)
+	if len(calls) != 1 {
+		t.Fatalf("tool calls = %+v, want exactly one", calls)
+	}
+	want := provider.ToolCall{ID: "call_abc", Name: "transfer_to_agent", Arguments: `{"department":"sales"}`}
+	if calls[0] != want {
+		t.Errorf("call = %+v, want %+v", calls[0], want)
+	}
+	if len(all) != 2 || all[0].Kind != provider.LLMToolCall || all[1].Kind != provider.LLMDone {
+		t.Fatalf("chunks = %+v, want the call then done", all)
+	}
+	if all[1].FinishReason != provider.FinishStop {
+		t.Errorf("finish reason = %q, want stop: a tool call is a completed turn", all[1].FinishReason)
+	}
+}
+
+// TestLLMToolCallWithText: a spoken preamble and a call in one generation.
+func TestLLMToolCallWithText(t *testing.T) {
+	_, srv := newFakeChat(t,
+		delta("Let me check that. "),
+		toolFragment(0, "call_1", "take_message", `{}`),
+		toolFinish(), "data: [DONE]")
+	ch, err := newTestLLM(srv.URL).Chat(context.Background(), provider.ChatRequest{
+		Tools: []provider.ToolDef{{Name: "take_message"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls, all := collectCalls(t, ch)
+	if len(calls) != 1 || calls[0].Name != "take_message" {
+		t.Fatalf("tool calls = %+v", calls)
+	}
+	if len(all) != 3 || all[0].Kind != provider.LLMTextDelta || all[1].Kind != provider.LLMToolCall || all[2].Kind != provider.LLMDone {
+		t.Fatalf("chunks = %+v, want text, call, done", all)
+	}
+}
+
+// TestLLMToolCallCancelledMidArguments: cancelling while arguments are still
+// fragmented must yield no call at all — a partial call never reaches the
+// session (docs/protocol-profile.md §6).
+func TestLLMToolCallCancelledMidArguments(t *testing.T) {
+	f, srv := newFakeChat(t,
+		toolFragment(0, "call_abc", "hangup", `{"reas`),
+		toolFragment(0, "", "", `on":"done"}`),
+		toolFinish(), "data: [DONE]")
+	f.mu.Lock()
+	f.hold = make(chan struct{})
+	f.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	ch, err := newTestLLM(srv.URL).Chat(ctx, provider.ChatRequest{Tools: []provider.ToolDef{{Name: "hangup"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The handler holds after the first fragment, so cancelling now lands
+	// mid-arguments.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	calls, _ := collectCalls(t, ch)
+	if len(calls) != 0 {
+		t.Fatalf("tool calls = %+v, want none after a mid-arguments cancel", calls)
+	}
+}
+
+// TestLLMToolCallTruncatedArguments: max_output_tokens mid-arguments leaves
+// the arguments unusable, so no call is delivered.
+func TestLLMToolCallTruncatedArguments(t *testing.T) {
+	_, srv := newFakeChat(t,
+		toolFragment(0, "call_abc", "hangup", `{"reas`),
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}`,
+		"data: [DONE]")
+	ch, err := newTestLLM(srv.URL).Chat(context.Background(), provider.ChatRequest{Tools: []provider.ToolDef{{Name: "hangup"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls, all := collectCalls(t, ch)
+	if len(calls) != 0 {
+		t.Fatalf("tool calls = %+v, want none for a truncated generation", calls)
+	}
+	if len(all) != 1 || all[0].Kind != provider.LLMDone || all[0].FinishReason != provider.FinishLength {
+		t.Fatalf("chunks = %+v, want done/length", all)
+	}
+}
+
+// TestLLMMultipleToolCallsAreAnError: more than one call is reported, never
+// silently dropped.
+func TestLLMMultipleToolCallsAreAnError(t *testing.T) {
+	_, srv := newFakeChat(t,
+		toolFragment(0, "call_1", "hangup", `{}`),
+		toolFragment(1, "call_2", "take_message", `{}`),
+		toolFinish(), "data: [DONE]")
+	ch, err := newTestLLM(srv.URL).Chat(context.Background(), provider.ChatRequest{
+		Tools: []provider.ToolDef{{Name: "hangup"}, {Name: "take_message"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls, all := collectCalls(t, ch)
+	if len(calls) != 1 || calls[0].ID != "call_1" {
+		t.Fatalf("tool calls = %+v, want only the first", calls)
+	}
+	if len(all) != 2 || all[1].Kind != provider.LLMError {
+		t.Fatalf("chunks = %+v, want the first call then an error", all)
+	}
+	var perr *provider.Error
+	if !errors.As(all[1].Err, &perr) {
+		t.Fatalf("error = %v, want a provider.Error", all[1].Err)
+	}
+}
+
+// TestLLMToolsSerialization: the nested Chat Completions shape, an explicit
+// tool_choice and parallel_tool_calls:false.
+func TestLLMToolsSerialization(t *testing.T) {
+	f, srv := newFakeChat(t, delta("ok"), "data: [DONE]")
+	ch, err := newTestLLM(srv.URL).Chat(context.Background(), provider.ChatRequest{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}},
+		Tools: []provider.ToolDef{{
+			Name: "hangup", Description: "end the call",
+			Parameters: json.RawMessage(`{"type":"object","properties":{}}`),
+		}},
+		ToolChoice: provider.ToolChoice{Mode: provider.ToolChoiceAuto},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	collect(t, ch)
+	body := f.request()
+	if body["tool_choice"] != "auto" {
+		t.Errorf("tool_choice = %v, want %q", body["tool_choice"], "auto")
+	}
+	if body["parallel_tool_calls"] != false {
+		t.Errorf("parallel_tool_calls = %v, want false", body["parallel_tool_calls"])
+	}
+	tools, _ := body["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("tools = %v", body["tools"])
+	}
+	tool := tools[0].(map[string]any)
+	if tool["type"] != "function" {
+		t.Errorf("tools[0].type = %v", tool["type"])
+	}
+	fn, _ := tool["function"].(map[string]any)
+	if fn["name"] != "hangup" || fn["description"] != "end the call" {
+		t.Errorf("tools[0].function = %v", fn)
+	}
+	if params, _ := fn["parameters"].(map[string]any); params["type"] != "object" {
+		t.Errorf("tools[0].function.parameters = %v, want the schema passed through verbatim", fn["parameters"])
+	}
+}
+
+// TestLLMForcedToolChoice: the object form of tool_choice.
+func TestLLMForcedToolChoice(t *testing.T) {
+	f, srv := newFakeChat(t, delta("ok"), "data: [DONE]")
+	ch, err := newTestLLM(srv.URL).Chat(context.Background(), provider.ChatRequest{
+		Tools:      []provider.ToolDef{{Name: "hangup"}},
+		ToolChoice: provider.ToolChoice{Mode: provider.ToolChoiceFunction, Name: "hangup"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	collect(t, ch)
+	choice, _ := f.request()["tool_choice"].(map[string]any)
+	if choice["type"] != "function" {
+		t.Fatalf("tool_choice = %v", f.request()["tool_choice"])
+	}
+	if fn, _ := choice["function"].(map[string]any); fn["name"] != "hangup" {
+		t.Errorf("tool_choice.function = %v", choice["function"])
+	}
+}
+
+// TestLLMNoToolFieldsWithoutTools: the API rejects tool_choice and
+// parallel_tool_calls on a request that declares no tools, so a tool-less
+// session must send neither.
+func TestLLMNoToolFieldsWithoutTools(t *testing.T) {
+	f, srv := newFakeChat(t, delta("ok"), "data: [DONE]")
+	ch, err := newTestLLM(srv.URL).Chat(context.Background(), provider.ChatRequest{
+		Messages:   []provider.Message{{Role: provider.RoleUser, Content: "hi"}},
+		ToolChoice: provider.ToolChoice{Mode: provider.ToolChoiceAuto},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	collect(t, ch)
+	for _, k := range []string{"tools", "tool_choice", "parallel_tool_calls"} {
+		if _, present := f.request()[k]; present {
+			t.Errorf("%s is present on a request that declares no tools", k)
+		}
+	}
+}
+
+// TestLLMToolHistoryReplay: an assistant turn that spoke and called, then the
+// tool result, projected onto the Chat Completions shape.
+func TestLLMToolHistoryReplay(t *testing.T) {
+	f, srv := newFakeChat(t, delta("ok"), "data: [DONE]")
+	ch, err := newTestLLM(srv.URL).Chat(context.Background(), provider.ChatRequest{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: "put me through to sales"},
+			{Role: provider.RoleAssistant, Content: "One moment.", ToolCalls: []provider.ToolCall{
+				{ID: "call_abc", Name: "transfer_to_agent", Arguments: `{"department":"sales"}`},
+			}},
+			{Role: provider.RoleTool, ToolCallID: "call_abc", Content: "no agent available"},
+		},
+		Tools: []provider.ToolDef{{Name: "transfer_to_agent"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	collect(t, ch)
+	msgs, _ := f.request()["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("messages = %v", msgs)
+	}
+	assistant := msgs[1].(map[string]any)
+	if assistant["content"] != "One moment." {
+		t.Errorf("assistant.content = %v", assistant["content"])
+	}
+	tcs, _ := assistant["tool_calls"].([]any)
+	if len(tcs) != 1 {
+		t.Fatalf("assistant.tool_calls = %v", assistant["tool_calls"])
+	}
+	tc := tcs[0].(map[string]any)
+	if tc["id"] != "call_abc" || tc["type"] != "function" {
+		t.Errorf("tool_calls[0] = %v", tc)
+	}
+	fn, _ := tc["function"].(map[string]any)
+	if fn["name"] != "transfer_to_agent" || fn["arguments"] != `{"department":"sales"}` {
+		t.Errorf("tool_calls[0].function = %v", fn)
+	}
+	result := msgs[2].(map[string]any)
+	if result["role"] != "tool" || result["tool_call_id"] != "call_abc" || result["content"] != "no agent available" {
+		t.Errorf("tool result message = %v", result)
+	}
+	if _, present := msgs[0].(map[string]any)["tool_calls"]; present {
+		t.Error("a plain user message must not carry tool_calls")
+	}
+}
+
+// TestLLMToolChoiceModes: the wire mapping of every tool_choice form. Only
+// "auto" is verified against the live DashScope endpoint in Phase 7 (see
+// TestRealLLMToolCall); the other three are covered here only.
+func TestLLMToolChoiceModes(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		choice provider.ToolChoice
+		want   any
+	}{
+		{"zero value defaults to auto", provider.ToolChoice{}, "auto"},
+		{"auto", provider.ToolChoice{Mode: provider.ToolChoiceAuto}, "auto"},
+		{"none", provider.ToolChoice{Mode: provider.ToolChoiceNone}, "none"},
+		{"required", provider.ToolChoice{Mode: provider.ToolChoiceRequired}, "required"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, srv := newFakeChat(t, delta("ok"), "data: [DONE]")
+			ch, err := newTestLLM(srv.URL).Chat(context.Background(), provider.ChatRequest{
+				Tools: []provider.ToolDef{{Name: "hangup"}}, ToolChoice: tc.choice,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			collect(t, ch)
+			if got := f.request()["tool_choice"]; got != tc.want {
+				t.Errorf("tool_choice = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
