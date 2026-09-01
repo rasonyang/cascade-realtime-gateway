@@ -67,7 +67,7 @@ func TestLLMStreamsChunksAndUsage(t *testing.T) {
 		)
 	}))
 	defer srv.Close()
-	llm := NewLLM("sk-x", LLMOptions{httpOptions: opts(srv.URL + "/v1"), Model: "gpt-test"})
+	llm := NewLLM("sk-x", LLMOptions{httpOptions: opts(srv.URL + "/v1"), Model: "gpt-test", ReasoningEffort: "minimal"})
 	ch, err := llm.Chat(context.Background(), provider.ChatRequest{
 		Instructions: "Be kind.", MaxOutputTokens: 50,
 		Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}, {Role: provider.RoleAssistant, Content: "yo"}},
@@ -82,11 +82,28 @@ func TestLLMStreamsChunksAndUsage(t *testing.T) {
 	if got[2].FinishReason != provider.FinishLength || got[2].Usage != (provider.Usage{InputTokens: 12, OutputTokens: 3}) {
 		t.Fatalf("done = %+v", got[2])
 	}
-	if gotAuth != "Bearer sk-x" || !gotBody.Stream || !gotBody.StreamOptions.IncludeUsage || gotBody.Model != "gpt-test" || gotBody.MaxCompletionTokens != 50 {
+	if gotAuth != "Bearer sk-x" || !gotBody.Stream || !gotBody.StreamOptions.IncludeUsage || gotBody.Model != "gpt-test" || gotBody.MaxCompletionTokens != 50 || gotBody.ReasoningEffort != "minimal" {
 		t.Fatalf("request = %+v auth=%q", gotBody, gotAuth)
 	}
 	if len(gotBody.Messages) != 3 || gotBody.Messages[0].Role != "system" || gotBody.Messages[0].Content != "Be kind." || gotBody.Messages[2].Role != "assistant" {
 		t.Fatalf("messages = %+v", gotBody.Messages)
+	}
+}
+
+func TestLLMOmitsReasoningEffortByDefault(t *testing.T) {
+	var raw map[string]json.RawMessage
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&raw)
+		sse(w, `[DONE]`)
+	}))
+	defer srv.Close()
+	ch, _ := NewLLM("k", LLMOptions{httpOptions: opts(srv.URL)}).Chat(context.Background(), provider.ChatRequest{})
+	drain(t, ch)
+	if _, present := raw["reasoning_effort"]; present {
+		t.Fatal("reasoning_effort must be omitted when not configured")
+	}
+	if _, present := raw["max_completion_tokens"]; present {
+		t.Fatal("max_completion_tokens must be omitted when unlimited")
 	}
 }
 

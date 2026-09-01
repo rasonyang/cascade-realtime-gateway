@@ -1,0 +1,13 @@
+{
+  "name": "cascade-sdkcheck",
+  "private": true,
+  "description": "Manual check of Cascade against the official openai-node GA realtime client",
+  "scripts": {
+    "text": "node sdkcheck.js",
+    "audio": "node sdkcheck-audio.js"
+  },
+  "dependencies": {
+    "openai": "^7.8.0",
+    "ws": "^8.21.3"
+  }
+}

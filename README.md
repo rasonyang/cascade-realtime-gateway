@@ -15,6 +15,16 @@ put a TLS terminator in front of it for `wss://` (the official OpenAI SDKs requi
 Architecture rules live in `CLAUDE.md`; the implementation plan in `docs/implementation-brief.md`;
 the protocol compatibility profile in `docs/protocol-profile.md` (Phase 2).
 
+## Providers
+
+`providers.llm.options` for `openai`: `model`, `base_url`, `request_timeout`, `stream_idle_timeout`, and
+`reasoning_effort` (sent only when set; e.g. `"minimal"` on gpt-5 models, `"none"` where the model supports it —
+non-reasoning models reject the field). `providers.tts.options`: `model`, `base_url`, timeouts.
+`providers.asr.options` for `deepgram`: `model`, `language`, `smart_format`, `endpointing_ms`, `utterance_end_ms`,
+`connect_timeout`, `finalize_timeout`, `keepalive_interval`, `audio_queue_frames`.
+
+A manual check against the official OpenAI SDK lives in `hack/sdkcheck/`.
+
 ## Observability
 
 Set `observability.otel_endpoint` to an OTLP/HTTP collector (`"127.0.0.1:4318"`) to export spans

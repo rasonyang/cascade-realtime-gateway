@@ -16,9 +16,13 @@ import (
 )
 
 // LLMOptions is the "options" block of providers.llm for type "openai".
+// ReasoningEffort is passed through verbatim when set ("none", "minimal",
+// "low", …); supported values differ per model and non-reasoning models
+// reject the field, so it has no default.
 type LLMOptions struct {
 	httpOptions
-	Model string `json:"model"`
+	Model           string `json:"model"`
+	ReasoningEffort string `json:"reasoning_effort"`
 }
 
 const defaultChatModel = "gpt-4o-mini"
@@ -69,6 +73,7 @@ type chatRequest struct {
 	Stream              bool          `json:"stream"`
 	StreamOptions       streamOptions `json:"stream_options"`
 	MaxCompletionTokens int           `json:"max_completion_tokens,omitempty"`
+	ReasoningEffort     string        `json:"reasoning_effort,omitempty"`
 }
 
 type streamOptions struct {
@@ -91,7 +96,8 @@ type chatChunk struct {
 // Chat implements provider.LLM: it returns as soon as the request has been
 // issued; the stream is consumed by a goroutine that exits on ctx.Done.
 func (l *LLM) Chat(ctx context.Context, req provider.ChatRequest) (<-chan provider.LLMChunk, error) {
-	body := chatRequest{Model: l.opts.Model, Stream: true, StreamOptions: streamOptions{IncludeUsage: true}, MaxCompletionTokens: req.MaxOutputTokens}
+	body := chatRequest{Model: l.opts.Model, Stream: true, StreamOptions: streamOptions{IncludeUsage: true},
+		MaxCompletionTokens: req.MaxOutputTokens, ReasoningEffort: l.opts.ReasoningEffort}
 	if req.Instructions != "" {
 		body.Messages = append(body.Messages, chatMessage{Role: "system", Content: req.Instructions})
 	}
