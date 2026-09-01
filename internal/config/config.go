@@ -142,11 +142,13 @@ type Observability struct {
 	OTelEndpoint string `json:"otel_endpoint"`
 }
 
-// Server-side VAD defaults, applied when a server_vad block omits them.
+// Server-side VAD defaults, applied when a server_vad block omits them. They
+// are exported because semantic_vad exposes no acoustic tuning fields, so the
+// session's acoustic VAD falls back to them in that mode.
 const (
-	defaultVADThreshold         = 0.5
-	defaultVADPrefixPaddingMs   = 300
-	defaultVADSilenceDurationMs = 500
+	DefaultVADThreshold         = 0.5
+	DefaultVADPrefixPaddingMs   = 300
+	DefaultVADSilenceDurationMs = 500
 	defaultSemanticEagerness    = "auto"
 )
 
@@ -191,22 +193,22 @@ func DefaultConfig() *Config {
 	}
 }
 
-// applyTurnDetectionDefaults fills the mode-specific tuning fields that the
-// file omitted. Fields belonging to the other mode are left untouched so that
-// Validate can reject them.
-func (td *TurnDetection) applyDefaults() {
+// ApplyDefaults fills the mode-specific tuning fields that were omitted.
+// Fields belonging to the other mode are left untouched so that Validate can
+// reject them.
+func (td *TurnDetection) ApplyDefaults() {
 	switch td.Type {
 	case TurnDetectionServerVAD:
 		if td.Threshold == nil {
-			v := defaultVADThreshold
+			v := DefaultVADThreshold
 			td.Threshold = &v
 		}
 		if td.PrefixPaddingMs == nil {
-			v := defaultVADPrefixPaddingMs
+			v := DefaultVADPrefixPaddingMs
 			td.PrefixPaddingMs = &v
 		}
 		if td.SilenceDurationMs == nil {
-			v := defaultVADSilenceDurationMs
+			v := DefaultVADSilenceDurationMs
 			td.SilenceDurationMs = &v
 		}
 	case TurnDetectionSemanticVAD:
@@ -215,4 +217,48 @@ func (td *TurnDetection) applyDefaults() {
 			td.Eagerness = &v
 		}
 	}
+}
+
+// Clone returns a deep copy so a session can hold an immutable snapshot.
+func (s SessionDefaults) Clone() SessionDefaults {
+	out := s
+	out.OutputModalities = append([]string(nil), s.OutputModalities...)
+	if s.Audio.Input.Transcription != nil {
+		t := *s.Audio.Input.Transcription
+		out.Audio.Input.Transcription = &t
+	}
+	if s.Audio.Input.TurnDetection != nil {
+		out.Audio.Input.TurnDetection = s.Audio.Input.TurnDetection.Clone()
+	}
+	return out
+}
+
+// Clone returns a deep copy.
+func (td *TurnDetection) Clone() *TurnDetection {
+	if td == nil {
+		return nil
+	}
+	out := *td
+	clone := func(p *float64) *float64 {
+		if p == nil {
+			return nil
+		}
+		v := *p
+		return &v
+	}
+	cloneInt := func(p *int) *int {
+		if p == nil {
+			return nil
+		}
+		v := *p
+		return &v
+	}
+	out.Threshold = clone(td.Threshold)
+	out.PrefixPaddingMs = cloneInt(td.PrefixPaddingMs)
+	out.SilenceDurationMs = cloneInt(td.SilenceDurationMs)
+	if td.Eagerness != nil {
+		v := *td.Eagerness
+		out.Eagerness = &v
+	}
+	return &out
 }

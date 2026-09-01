@@ -72,7 +72,7 @@ func Parse(raw []byte, lookupEnv func(string) (string, bool)) (*Config, error) {
 	}
 
 	if td := cfg.SessionDefaults.Audio.Input.TurnDetection; td != nil {
-		td.applyDefaults()
+		td.ApplyDefaults()
 	}
 	return cfg, nil
 }

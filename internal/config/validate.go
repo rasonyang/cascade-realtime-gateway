@@ -39,7 +39,7 @@ func (c *Config) Validate(known ProviderLookup) error {
 			return fieldErrorf(field, "unknown provider %q", p.cfg.Type)
 		}
 	}
-	if err := c.SessionDefaults.validate("session_defaults"); err != nil {
+	if err := c.SessionDefaults.Validate("session_defaults"); err != nil {
 		return err
 	}
 	if err := c.Limits.validate("limits"); err != nil {
@@ -52,7 +52,9 @@ func (c *Config) Validate(known ProviderLookup) error {
 	return nil
 }
 
-func (s *SessionDefaults) validate(prefix string) error {
+// Validate checks a session object; prefix is prepended to field paths so the
+// same checks serve both the config file and protocol-level session updates.
+func (s *SessionDefaults) Validate(prefix string) error {
 	mods := s.OutputModalities
 	if len(mods) != 1 || (mods[0] != ModalityAudio && mods[0] != ModalityText) {
 		return fieldErrorf(prefix+".output_modalities", `must be exactly ["audio"] or ["text"]`)

@@ -12,6 +12,10 @@ import (
 
 	"github.com/rasonyang/cascade-realtime-gateway/internal/config"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/observability"
+	"github.com/rasonyang/cascade-realtime-gateway/internal/provider"
+
+	// Providers register themselves with the registry from init.
+	_ "github.com/rasonyang/cascade-realtime-gateway/internal/provider/mock"
 )
 
 func main() {
@@ -31,9 +35,7 @@ func run(args []string) int {
 		fmt.Fprintf(os.Stderr, "cascade: %s: %v\n", *configPath, err)
 		return 1
 	}
-	// Phase 0: no provider registry exists yet, so provider names are only
-	// checked for presence. Phase 1 wires the registry lookup here.
-	if err := cfg.Validate(nil); err != nil {
+	if err := cfg.Validate(provider.Known); err != nil {
 		fmt.Fprintf(os.Stderr, "cascade: %s: %v\n", *configPath, err)
 		return 1
 	}
