@@ -85,10 +85,11 @@ type Session struct {
 
 	audioEmitted bool // first output audio delta sent: voice is locked (GA)
 
-	speechItem    ItemRef // pre-allocated at speech start, reused by commit
-	pendingItem   *item   // committed audio item awaiting its transcript
-	transcriptAcc string  // Finals accumulated since the last commit
-	partial       string  // latest ASR partial
+	speechItem    ItemRef   // pre-allocated at speech start, reused by commit
+	pendingItem   *item     // committed audio item awaiting its transcript
+	committedAt   time.Time // when pendingItem was committed; commit→final latency
+	transcriptAcc string    // Finals accumulated since the last commit
+	partial       string    // latest ASR partial
 
 	asrWaitTimer *time.Timer
 	asrWait      <-chan time.Time
@@ -704,6 +705,7 @@ func (s *Session) commit(tag string) {
 	}}
 	prev := s.conv.append(it)
 	s.pendingItem = it
+	s.committedAt = time.Now()
 	s.emit(EvAudioBufferCommitted{Item: ref, PreviousItem: prev})
 	s.emit(EvItemAdded{Item: it.snapshot(), PreviousItem: prev})
 	if err := s.asrStream.Finalize(); err != nil {
@@ -766,6 +768,9 @@ func (s *Session) completePendingItem(text, delta string) {
 	it := s.pendingItem
 	s.pendingItem = nil
 	s.transcriptAcc = ""
+	// Core metric: commit → ASR Final. Logged per turn now; Phase 5 exports
+	// it as a histogram.
+	s.log.Info("transcript final", "item", it.Ref, "commit_to_final_ms", time.Since(s.committedAt).Milliseconds(), "chars", len(text))
 	it.Text = text
 	it.TranscriptDone = true
 	it.Status = ItemCompleted

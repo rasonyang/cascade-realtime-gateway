@@ -288,3 +288,22 @@ func New(kind Kind, name, apiKey string, options json.RawMessage) (Provider, err
 	}
 	return p, nil
 }
+
+// ErrorFromStatus classifies an HTTP status into an Error for provider name.
+// body is included in the message, truncated, and must not contain secrets.
+func ErrorFromStatus(name string, status int, body string) *Error {
+	kind := ErrFatal
+	switch {
+	case status == 401 || status == 403:
+		kind = ErrAuth
+	case status == 429:
+		kind = ErrRateLimit
+	case status >= 500 || status == 408:
+		kind = ErrTransient
+	}
+	const maxBody = 200
+	if len(body) > maxBody {
+		body = body[:maxBody] + "…"
+	}
+	return &Error{Provider: name, Kind: kind, Err: fmt.Errorf("http %d: %s", status, body)}
+}

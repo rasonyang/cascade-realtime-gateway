@@ -68,9 +68,10 @@ func (f *fixture) wsURL(query string) string {
 }
 
 type client struct {
-	t    *testing.T
-	conn *websocket.Conn
-	resp *http.Response
+	t       *testing.T
+	conn    *websocket.Conn
+	resp    *http.Response
+	timeout time.Duration // per-read timeout; zero means waitTimeout
 }
 
 func (f *fixture) dial(query, token string) (*client, *http.Response, error) {
@@ -110,7 +111,11 @@ func (c *client) send(js string) {
 
 // read returns the next frame; ok=false on close, with the close error.
 func (c *client) read() (map[string]any, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), waitTimeout)
+	d := c.timeout
+	if d == 0 {
+		d = waitTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), d)
 	defer cancel()
 	_, data, err := c.conn.Read(ctx)
 	if err != nil {

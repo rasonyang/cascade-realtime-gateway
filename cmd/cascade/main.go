@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -20,7 +21,9 @@ import (
 	"github.com/rasonyang/cascade-realtime-gateway/internal/server"
 
 	// Providers register themselves with the registry from init.
+	_ "github.com/rasonyang/cascade-realtime-gateway/internal/provider/deepgram"
 	_ "github.com/rasonyang/cascade-realtime-gateway/internal/provider/mock"
+	_ "github.com/rasonyang/cascade-realtime-gateway/internal/provider/openai"
 )
 
 func main() {
@@ -51,6 +54,7 @@ func run(args []string) int {
 		return 1
 	}
 	log := observability.NewLogger(os.Stdout, level)
+	slog.SetDefault(log) // providers log lifecycle facts through the default logger
 
 	turnDetection := "null"
 	if td := cfg.SessionDefaults.Audio.Input.TurnDetection; td != nil {

@@ -14,3 +14,12 @@ put a TLS terminator in front of it for `wss://` (the official OpenAI SDKs requi
 
 Architecture rules live in `CLAUDE.md`; the implementation plan in `docs/implementation-brief.md`;
 the protocol compatibility profile in `docs/protocol-profile.md` (Phase 2).
+
+## Tests
+
+```sh
+go test -race ./...                                   # unit, session, protocol conformance, server
+CASCADE_E2E_LLM_MODEL=gpt-5-nano \
+  DEEPGRAM_API_KEY=... OPENAI_API_KEY=... \
+  go test -tags e2e -run TestE2E -v ./internal/server  # one real voice turn + interrupts (network)
+```
