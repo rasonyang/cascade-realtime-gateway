@@ -24,6 +24,7 @@ import (
 	_ "github.com/rasonyang/cascade-realtime-gateway/internal/provider/deepgram"
 	_ "github.com/rasonyang/cascade-realtime-gateway/internal/provider/mock"
 	_ "github.com/rasonyang/cascade-realtime-gateway/internal/provider/openai"
+	_ "github.com/rasonyang/cascade-realtime-gateway/internal/provider/qwen"
 )
 
 func main() {

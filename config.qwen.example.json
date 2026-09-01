@@ -1,0 +1,36 @@
+{
+  "listen": ":8080",
+  "auth": { "api_key": "{env.REALTIME_API_KEY}" },
+  "providers": {
+    "asr": { "type": "qwen", "api_key": "{env.ALIYUN_API_KEY}", "options": { "model": "qwen-audio-3.0-asr-flash-streaming" } },
+    "llm": { "type": "qwen", "api_key": "{env.ALIYUN_API_KEY}", "options": { "model": "qwen3.6-flash" } },
+    "tts": { "type": "qwen", "api_key": "{env.ALIYUN_API_KEY}", "options": { "model": "qwen-audio-3.0-tts-flash" } }
+  },
+  "session_defaults": {
+    "instructions": "You are a helpful assistant.",
+    "output_modalities": ["audio"],
+    "audio": {
+      "input": {
+        "format": { "type": "audio/pcm", "rate": 24000 },
+        "transcription": {},
+        "turn_detection": {
+          "type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 500,
+          "create_response": true, "interrupt_response": true
+        }
+      },
+      "output": { "format": { "type": "audio/pcm", "rate": 24000 }, "voice": "longanlingxi", "speed": 1.0 }
+    },
+    "max_output_tokens": "inf"
+  },
+  "limits": {
+    "max_sessions": 100,
+    "session_timeout": "30m",
+    "input_audio_queue_frames": 200,
+    "input_audio_buffer_max_ms": 60000,
+    "asr_final_timeout": "2s",
+    "output_event_queue": 256,
+    "client_write_timeout": "10s",
+    "client_max_message_bytes": 16777216
+  },
+  "observability": { "log_level": "info", "otel_endpoint": "" }
+}

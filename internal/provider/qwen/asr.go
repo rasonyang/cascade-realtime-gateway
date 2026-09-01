@@ -1,0 +1,540 @@
+package qwen
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/coder/websocket"
+
+	"github.com/rasonyang/cascade-realtime-gateway/internal/audio"
+	"github.com/rasonyang/cascade-realtime-gateway/internal/config"
+	"github.com/rasonyang/cascade-realtime-gateway/internal/provider"
+)
+
+// ASROptions is the "options" block of providers.asr for type "qwen".
+type ASROptions struct {
+	wsOptions
+	Model    string `json:"model"`
+	Language string `json:"language"`
+	// FinalizeTimeout bounds the wait for task-finished after a Finalize.
+	// On expiry the stream synthesizes EndOfTurn and restarts the task so
+	// the ASRStream contract still holds.
+	FinalizeTimeout config.Duration `json:"finalize_timeout"`
+	// AudioQueueFrames bounds audio buffered ahead of the socket writer; a
+	// full queue makes PushAudio fail, which the session treats as fatal.
+	// The queue also absorbs the audio that arrives while a task is
+	// restarting, so nothing is dropped between turns.
+	AudioQueueFrames int `json:"audio_queue_frames"`
+}
+
+const (
+	defaultASRModel         = "qwen-audio-3.0-asr-flash-streaming"
+	defaultFinalizeTimeout  = 3 * time.Second
+	defaultAudioQueueFrames = 500 // 10 s of 20 ms frames
+	asrEventQueue           = 32
+	asrCtlQueue             = 8
+)
+
+func (o *ASROptions) applyDefaults() {
+	o.wsOptions.applyDefaults()
+	if o.Model == "" {
+		o.Model = defaultASRModel
+	}
+	if o.FinalizeTimeout == 0 {
+		o.FinalizeTimeout = config.Duration(defaultFinalizeTimeout)
+	}
+	if o.AudioQueueFrames == 0 {
+		o.AudioQueueFrames = defaultAudioQueueFrames
+	}
+}
+
+func init() {
+	provider.Register(provider.KindASR, Name, func(apiKey string, raw json.RawMessage) (provider.Provider, error) {
+		var o ASROptions
+		if len(raw) > 0 {
+			if err := json.Unmarshal(raw, &o); err != nil {
+				return nil, fmt.Errorf("qwen asr options: %w", err)
+			}
+		}
+		return NewASR(apiKey, o), nil
+	})
+}
+
+// ASR is the streaming recognition provider.
+type ASR struct {
+	apiKey string
+	opts   ASROptions
+}
+
+// NewASR builds the provider with defaults applied.
+func NewASR(apiKey string, o ASROptions) *ASR {
+	o.applyDefaults()
+	return &ASR{apiKey: apiKey, opts: o}
+}
+
+// Kind implements provider.Provider.
+func (a *ASR) Kind() provider.Kind { return provider.KindASR }
+
+// asrParameters is the run-task parameter block for recognition.
+type asrParameters struct {
+	Format        string   `json:"format"`
+	SampleRate    int      `json:"sample_rate"`
+	LanguageHints []string `json:"language_hints,omitempty"`
+}
+
+// asrResult is the result-generated payload. Only the outer output.sentence
+// is read; the service repeats the same object nested one level deeper.
+type asrResult struct {
+	Output struct {
+		Sentence *asrSentence `json:"sentence"`
+	} `json:"output"`
+}
+
+type asrSentence struct {
+	SentenceID  int    `json:"sentence_id"`
+	BeginTime   *int   `json:"begin_time"`
+	EndTime     *int   `json:"end_time"`
+	Text        string `json:"text"`
+	SentenceEnd bool   `json:"sentence_end"`
+}
+
+// OpenStream implements provider.ASR. It dials DashScope (bounded by
+// connect_timeout) and starts the reader and writer goroutines; the first
+// run-task is sent by the writer.
+//
+// One socket carries the whole session, but recognition runs as one task per
+// turn: Finalize ends the current task with finish-task, which flushes the
+// final transcript in a few hundred milliseconds instead of waiting for the
+// model's own end-of-utterance judgement, and the next task is started on
+// the same connection for ~25 ms. Audio that arrives while a task is
+// restarting waits in the queue, so no audio is ever sent before
+// task-started and none is dropped.
+func (a *ASR) OpenStream(ctx context.Context, cfg provider.ASRConfig) (provider.ASRStream, error) {
+	conn, err := dial(ctx, a.opts.wsOptions, a.apiKey)
+	if err != nil {
+		return nil, err
+	}
+	rate := cfg.SampleRate
+	if rate == 0 {
+		rate = audio.SampleRate
+	}
+	params := asrParameters{Format: "pcm", SampleRate: rate}
+	if lang := firstNonEmpty(cfg.Language, a.opts.Language); lang != "" {
+		params.LanguageHints = []string{lang}
+	}
+	sctx, scancel := context.WithCancel(ctx)
+	s := &asrStream{
+		opts:       a.opts,
+		model:      firstNonEmpty(cfg.Model, a.opts.Model),
+		params:     params,
+		conn:       conn,
+		ctx:        sctx,
+		cancel:     scancel,
+		in:         make(chan []byte, a.opts.AudioQueueFrames),
+		finalize:   make(chan struct{}, 1),
+		closeReq:   make(chan struct{}),
+		ctl:        make(chan inHeader, asrCtlQueue),
+		events:     make(chan provider.ASREvent, asrEventQueue),
+		done:       make(chan struct{}),
+		writerDone: make(chan struct{}),
+		closeSent:  make(chan struct{}),
+		openedAt:   time.Now(),
+	}
+	slog.Debug("qwen asr stream opened", "provider", Name, "model", s.model, "sample_rate", rate)
+	go s.reader()
+	go s.writer()
+	return s, nil
+}
+
+// ---- stream ----------------------------------------------------------------
+
+type asrStream struct {
+	opts   ASROptions
+	model  string
+	params asrParameters
+	conn   *websocket.Conn
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	in       chan []byte   // audio waiting for the socket writer
+	finalize chan struct{} // Finalize requests
+	closeReq chan struct{} // Close requests, so the writer can end the task
+	ctl      chan inHeader // task lifecycle frames, reader → writer
+	events   chan provider.ASREvent
+
+	done       chan struct{} // closed when the reader exits
+	writerDone chan struct{} // closed when the writer exits
+	closeSent  chan struct{} // closed once the final finish-task is on the wire
+	openedAt   time.Time
+
+	// baseMs is the audio timeline offset contributed by tasks that have
+	// already finished; it is bumped by the writer between tasks, which the
+	// reader observes only after task-finished, so no result can straddle it.
+	baseMs atomic.Int64
+	// closing suppresses the EndOfTurn that the Close handshake's
+	// task-finished would otherwise produce.
+	closing atomic.Bool
+	// runAtNanos is when the current run-task went on the wire, so the
+	// reader can report how long the service took to acknowledge it.
+	runAtNanos atomic.Int64
+
+	// currentTask is written by the writer before run-task and read by the
+	// reader for logging; guarded because both goroutines touch it.
+	mu          sync.Mutex
+	currentTask string
+	finalizeAt  time.Time
+	closed      bool
+}
+
+// PushAudio implements provider.ASRStream; it never blocks on the network.
+func (s *asrStream) PushAudio(pcm []byte) error {
+	if s.ctx.Err() != nil {
+		return s.ctx.Err()
+	}
+	select {
+	case s.in <- pcm:
+		return nil
+	default:
+		return transientf("audio queue full: socket writer stalled")
+	}
+}
+
+// Finalize implements provider.ASRStream: it asks the writer to end the
+// current recognition task, which makes the service emit the final
+// transcript immediately.
+func (s *asrStream) Finalize() error {
+	if s.ctx.Err() != nil {
+		return s.ctx.Err()
+	}
+	select {
+	case s.finalize <- struct{}{}:
+	default: // one already pending; the current task ends either way
+	}
+	return nil
+}
+
+// Events implements provider.ASRStream.
+func (s *asrStream) Events() <-chan provider.ASREvent { return s.events }
+
+// Close implements provider.ASRStream: finish-task is sent best-effort so the
+// service releases the task, then the socket is torn down and every
+// goroutine reclaimed.
+func (s *asrStream) Close() error {
+	s.mu.Lock()
+	already := s.closed
+	s.closed = true
+	s.mu.Unlock()
+	if !already {
+		s.closing.Store(true)
+		close(s.closeReq)
+		select {
+		case <-s.closeSent:
+		case <-s.writerDone:
+		case <-time.After(s.opts.ConnectTimeout.Std()):
+		}
+		s.cancel()
+	}
+	<-s.done
+	<-s.writerDone
+	return nil
+}
+
+func (s *asrStream) emit(ev provider.ASREvent) bool {
+	select {
+	case s.events <- ev:
+		return true
+	case <-s.ctx.Done():
+		return false
+	}
+}
+
+// ---- writer ----------------------------------------------------------------
+
+// writer owns conn.Write. It runs one recognition task at a time: run-task,
+// then audio once task-started has arrived, then finish-task on Finalize,
+// then the next run-task once task-finished has arrived.
+func (s *asrStream) writer() {
+	defer close(s.writerDone)
+	defer s.cancel()
+
+	var (
+		started    bool
+		finalizing bool
+		pending    bool // Finalize arrived before task-started
+		sentMs     int  // audio milliseconds written in the current task
+		deadline   <-chan time.Time
+		timer      *time.Timer
+	)
+	stopTimer := func() {
+		if timer != nil {
+			timer.Stop()
+			timer, deadline = nil, nil
+		}
+	}
+	defer stopTimer()
+
+	beginFinalize := func() bool {
+		// Everything already queued belongs to this turn: flush it before
+		// ending the task so no speech is lost.
+		for {
+			select {
+			case pcm := <-s.in:
+				if s.conn.Write(s.ctx, websocket.MessageBinary, pcm) != nil {
+					return false
+				}
+				sentMs += audio.BytesToMs(len(pcm))
+				continue
+			default:
+			}
+			break
+		}
+		if !s.sendFinish() {
+			return false
+		}
+		finalizing = true
+		s.mu.Lock()
+		s.finalizeAt = time.Now()
+		s.mu.Unlock()
+		timer = time.NewTimer(s.opts.FinalizeTimeout.Std())
+		deadline = timer.C
+		return true
+	}
+	restart := func() bool {
+		stopTimer()
+		s.baseMs.Add(int64(sentMs))
+		sentMs = 0
+		started, finalizing, pending = false, false, false
+		return s.sendRun()
+	}
+
+	if !s.sendRun() {
+		return
+	}
+	for {
+		// A nil channel blocks forever, which is exactly the gate: audio is
+		// written only while a task is running and not being finalized.
+		var audioCh chan []byte
+		if started && !finalizing {
+			audioCh = s.in
+		}
+		select {
+		case <-s.ctx.Done():
+			return
+
+		case <-s.closeReq:
+			// End the task politely, then let Close tear the socket down.
+			if started {
+				s.sendFinish()
+			}
+			close(s.closeSent)
+			return
+
+		case h := <-s.ctl:
+			switch h.Event {
+			case eventTaskStarted:
+				started = true
+				if pending && !beginFinalize() {
+					return
+				}
+			case eventTaskFinished:
+				if !restart() {
+					return
+				}
+			case eventTaskFailed:
+				return // the reader has already emitted the error
+			}
+
+		case <-s.finalize:
+			if finalizing {
+				continue // already ending this task
+			}
+			if !started {
+				pending = true
+				continue
+			}
+			if !beginFinalize() {
+				return
+			}
+
+		case <-deadline:
+			// No task-finished within finalize_timeout. Honor the contract
+			// with a synthesized EndOfTurn and start a fresh task.
+			s.mu.Lock()
+			waited := time.Since(s.finalizeAt)
+			s.mu.Unlock()
+			slog.Debug("qwen asr finalize timed out", "provider", Name, "waited_ms", waited.Milliseconds())
+			if !s.emit(provider.ASREvent{Kind: provider.ASREndOfTurn}) {
+				return
+			}
+			if !restart() {
+				return
+			}
+
+		case pcm := <-audioCh:
+			if s.conn.Write(s.ctx, websocket.MessageBinary, pcm) != nil {
+				return
+			}
+			sentMs += audio.BytesToMs(len(pcm))
+		}
+	}
+}
+
+func (s *asrStream) sendRun() bool {
+	id := taskID()
+	s.mu.Lock()
+	s.currentTask = id
+	s.mu.Unlock()
+	s.runAtNanos.Store(time.Now().UnixNano())
+	frame := runFrame[asrParameters]{
+		Header: newOutHeader(actionRunTask, id),
+		Payload: runPayload[asrParameters]{
+			TaskGroup:  "audio",
+			Task:       "asr",
+			Function:   "recognition",
+			Model:      s.model,
+			Parameters: s.params,
+		},
+	}
+	return writeJSON(s.ctx, s.conn, frame) == nil
+}
+
+func (s *asrStream) sendFinish() bool {
+	s.mu.Lock()
+	id := s.currentTask
+	s.mu.Unlock()
+	return writeJSON(s.ctx, s.conn, finishFrame{Header: newOutHeader(actionFinishTask, id)}) == nil
+}
+
+// ---- reader ----------------------------------------------------------------
+
+// reader owns conn.Read. It maps result-generated payloads to ASR events and
+// forwards task lifecycle frames to the writer. On exit it closes the socket
+// and the events channel, so cancellation tears everything down at once.
+func (s *asrStream) reader() {
+	defer close(s.done)
+	defer close(s.events)
+	defer s.conn.CloseNow() //nolint:errcheck
+	defer s.cancel()
+	reason := "cancelled"
+	defer func() {
+		slog.Debug("qwen asr stream closed", "provider", Name, "reason", reason, "lifetime_ms", time.Since(s.openedAt).Milliseconds())
+	}()
+
+	idle := time.AfterFunc(s.opts.IdleTimeout.Std(), s.cancel)
+	defer idle.Stop()
+	for {
+		typ, data, err := s.conn.Read(s.ctx)
+		if err != nil {
+			if s.ctx.Err() != nil {
+				return // cancelled or closed by us
+			}
+			if s.closing.Load() || websocket.CloseStatus(err) == websocket.StatusNormalClosure {
+				reason = "closed"
+				return
+			}
+			reason = "error"
+			s.emit(provider.ASREvent{Kind: provider.ASRError, Err: transientf("connection closed: %v", err)})
+			return
+		}
+		idle.Reset(s.opts.IdleTimeout.Std())
+		if typ != websocket.MessageText {
+			continue // recognition never sends binary frames
+		}
+		var frame struct {
+			Header  inHeader        `json:"header"`
+			Payload json.RawMessage `json:"payload"`
+		}
+		if err := json.Unmarshal(data, &frame); err != nil || frame.Header.Event == "" {
+			// Malformed or unrecognized frames are not fatal on their own;
+			// a genuinely broken task still ends in task-failed or a close.
+			slog.Debug("qwen asr ignoring unparseable frame", "provider", Name, "bytes", len(data))
+			continue
+		}
+		if !s.handle(frame.Header, frame.Payload) {
+			reason = reasonFor(frame.Header.Event)
+			return
+		}
+	}
+}
+
+func reasonFor(event string) string {
+	if event == eventTaskFailed {
+		return "task_failed"
+	}
+	return "cancelled"
+}
+
+// handle processes one frame and reports whether the reader should continue.
+func (s *asrStream) handle(h inHeader, payload json.RawMessage) bool {
+	switch h.Event {
+	case eventResultGenerated:
+		var res asrResult
+		if err := json.Unmarshal(payload, &res); err != nil || res.Output.Sentence == nil {
+			return true // nothing usable in this frame
+		}
+		return s.emitSentence(res.Output.Sentence)
+
+	case eventTaskStarted:
+		if at := s.runAtNanos.Load(); at != 0 {
+			slog.Debug("qwen asr task started", "provider", Name,
+				"started_ms", time.Since(time.Unix(0, at)).Seconds()*1000)
+		}
+		return s.toWriter(h)
+
+	case eventTaskFinished:
+		// The turn is over: the final transcript has already been emitted.
+		if !s.closing.Load() && !s.emit(provider.ASREvent{Kind: provider.ASREndOfTurn}) {
+			return false
+		}
+		return s.toWriter(h)
+
+	case eventTaskFailed:
+		s.emit(provider.ASREvent{Kind: provider.ASRError, Err: taskFailed(h)})
+		s.toWriter(h)
+		return false
+	}
+	return true
+}
+
+// emitSentence maps one recognition sentence onto the stream's audio
+// timeline. A sentence_end sentence is the turn's final transcript;
+// everything else is the interim text for the utterance in progress.
+func (s *asrStream) emitSentence(sn *asrSentence) bool {
+	if sn.Text == "" && !sn.SentenceEnd {
+		return true
+	}
+	base := int(s.baseMs.Load())
+	ev := provider.ASREvent{Text: sn.Text, StartMs: base, EndMs: base}
+	if sn.BeginTime != nil {
+		ev.StartMs = base + *sn.BeginTime
+	}
+	if sn.EndTime != nil {
+		ev.EndMs = base + *sn.EndTime
+	}
+	if sn.SentenceEnd {
+		ev.Kind = provider.ASRFinal
+	} else {
+		ev.Kind = provider.ASRPartial
+		ev.EndMs = ev.StartMs
+	}
+	return s.emit(ev)
+}
+
+// toWriter hands a lifecycle frame to the writer's state machine.
+func (s *asrStream) toWriter(h inHeader) bool {
+	select {
+	case s.ctl <- h:
+		return true
+	case <-s.ctx.Done():
+		return false
+	case <-s.writerDone:
+		return false
+	}
+}
+
+var _ provider.ASRStream = (*asrStream)(nil)
