@@ -89,6 +89,16 @@ func New(opts Options) *Adapter {
 // SessionID returns the wire session id.
 func (a *Adapter) SessionID() string { return a.sessionID }
 
+// NewSessionID returns a fresh sess_… identifier for callers that need it
+// before the adapter exists (the session actor logs by id).
+func NewSessionID() string { return newID("sess_") }
+
+// Reject returns an error frame for a client frame that never reached the
+// decoder (e.g. a binary WebSocket message).
+func (a *Adapter) Reject(message string) [][]byte {
+	return a.reject("", invalidEvent("", message))
+}
+
 // Hello returns the frames sent right after the upgrade: session.created
 // and conversation.created.
 func (a *Adapter) Hello() [][]byte {

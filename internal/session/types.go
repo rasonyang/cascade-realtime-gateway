@@ -23,6 +23,7 @@ const (
 	CloseInputOverflow    CloseReason = "input_queue_overflow"
 	CloseBufferOverflow   CloseReason = "input_audio_buffer_overflow"
 	CloseProviderError    CloseReason = "provider_error"
+	CloseSessionTimeout   CloseReason = "session_timeout"
 	CloseContextCancelled CloseReason = "context_cancelled"
 )
 

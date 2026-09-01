@@ -220,9 +220,13 @@ type closeError struct{ reason CloseReason }
 func (e closeError) Error() string { return "session closed: " + string(e.reason) }
 
 func reasonOf(ctx context.Context) CloseReason {
+	cause := context.Cause(ctx)
 	var ce closeError
-	if errors.As(context.Cause(ctx), &ce) {
+	if errors.As(cause, &ce) {
 		return ce.reason
+	}
+	if errors.Is(cause, context.DeadlineExceeded) {
+		return CloseSessionTimeout // the server bounds the session ctx by session_timeout
 	}
 	return CloseContextCancelled
 }
