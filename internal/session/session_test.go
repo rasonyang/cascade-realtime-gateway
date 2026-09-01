@@ -741,3 +741,29 @@ func TestAudioMsAccounting(t *testing.T) {
 		t.Fatalf("audio deltas %d ms vs item %d ms", audio.BytesToMs(total), d.Output[0].AudioMs)
 	}
 }
+
+// TestBareResponseOnEmptyConversation: a client that speaks first — a phone
+// bot greeting the caller — connects and sends response.create with nothing
+// in the conversation. The generation runs on the instructions alone; no
+// synthetic user item is required.
+func TestBareResponseOnEmptyConversation(t *testing.T) {
+	h := newHarness(t, defaultScripts(), manual)
+	h.post(CmdCreateResponse{})
+	done := h.waitResponseDone(0)
+	if done.Status != ResponseCompleted {
+		t.Fatalf("status = %s (%v)", done.Status, done.Err)
+	}
+	reqs := h.llm.Requests()
+	if len(reqs) != 1 {
+		t.Fatalf("requests = %d", len(reqs))
+	}
+	if len(reqs[0].Messages) != 0 {
+		t.Fatalf("messages = %+v, want none", reqs[0].Messages)
+	}
+	if reqs[0].Instructions == "" {
+		t.Fatal("the instructions must still reach the provider")
+	}
+	if len(done.Output) != 1 || done.Output[0].Text == "" {
+		t.Fatalf("output = %+v, want a spoken item", done.Output)
+	}
+}
