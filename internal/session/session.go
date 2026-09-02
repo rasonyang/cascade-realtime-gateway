@@ -704,11 +704,17 @@ func (s *Session) truncateItem(c CmdTruncateItem, tag string) {
 			fmt.Sprintf("audio_end_ms must be within [0, %d]", it.AudioMs))
 		return
 	}
+	before := len(it.Text)
+	generatedMs := it.AudioMs
 	it.Text = trimText(it.Text, it.segments, it.alignment, cut, it.audioB)
 	if cut < it.audioB {
 		it.audioB = cut
 		it.AudioMs = c.AudioEndMs
 	}
+	// How much the client reports was actually heard, and what trimming it
+	// cost the text the next turn will see.
+	s.log.Debug("item truncated", "item", c.ID, "audio_end_ms", c.AudioEndMs,
+		"generated_ms", generatedMs, "chars_before", before, "chars_after", len(it.Text))
 	s.emit(EvItemTruncated{ID: c.ID, ContentIndex: c.ContentIndex, AudioEndMs: c.AudioEndMs})
 }
 
@@ -739,6 +745,10 @@ func (s *Session) handleAudio(pcm []byte) {
 			if d.EmitSpeechStarted {
 				s.speechStartAt = time.Now()
 				s.firstPartial = false
+				// The instant a client's barge-in guard is measured from;
+				// responding reports whether a response was interrupted.
+				s.log.Debug("speech started", "item", s.speechItem, "audio_start_ms", startMs,
+					"responding", s.active != nil, "interrupt", d.Interrupt)
 				s.emit(EvSpeechStarted{AudioStartMs: startMs, Item: s.speechItem})
 			}
 			if d.Interrupt {

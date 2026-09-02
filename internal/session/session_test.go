@@ -767,3 +767,55 @@ func TestBareResponseOnEmptyConversation(t *testing.T) {
 		t.Fatalf("output = %+v, want a spoken item", done.Output)
 	}
 }
+
+// TestTruncateBoundarySemantics pins down what audio_end_ms is compared
+// against, and on which side the boundary falls. A client computing "how much
+// did the caller actually hear" needs both: the bound is the audio the
+// gateway actually emitted as deltas, and equality is accepted.
+func TestTruncateBoundarySemantics(t *testing.T) {
+	h := newHarness(t, defaultScripts(), manual)
+	h.post(CmdCreateItem{Item: ItemSpec{Role: RoleUser, Text: "hi"}})
+	h.post(CmdCreateResponse{})
+	done := h.waitResponseDone(0)
+	out := done.Output[0]
+	if out.Status != ItemCompleted {
+		t.Fatalf("item status = %s, want a finished item", out.Status)
+	}
+
+	// The bound is the sum of the audio deltas the client was sent, which is
+	// what the item reports as AudioMs.
+	var emitted int
+	for _, e := range h.all() {
+		if d, ok := e.(EvOutputAudioDelta); ok {
+			emitted += len(d.PCM)
+		}
+	}
+	if got := audio.BytesToMs(emitted); got != out.AudioMs {
+		t.Fatalf("emitted delta audio = %d ms, item reports %d ms", got, out.AudioMs)
+	}
+
+	// Exactly the emitted total: accepted, even though the item is completed.
+	h.post(CmdTruncateItem{Meta: Meta{Tag: "at"}, ID: out.Ref, AudioEndMs: out.AudioMs})
+	h.waitFor("truncate at the bound", func(e Event) bool {
+		tr, ok := e.(EvItemTruncated)
+		return ok && tr.AudioEndMs == out.AudioMs
+	})
+
+	// One millisecond past it: rejected, never clamped.
+	h.post(CmdTruncateItem{Meta: Meta{Tag: "over"}, ID: out.Ref, AudioEndMs: out.AudioMs + 1})
+	ev, _ := h.waitFor("out of range", func(e Event) bool {
+		er, ok := e.(EvError)
+		return ok && er.Tag == "over"
+	})
+	if e := ev.(EvError); e.Code != ErrCodeTruncateOutOfRange || e.Param != "audio_end_ms" {
+		t.Fatalf("error = %+v", e)
+	}
+	// The rejection left the item untouched.
+	h.post(CmdCreateItem{Item: ItemSpec{Role: RoleUser, Text: "go on"}})
+	h.post(CmdCreateResponse{})
+	h.waitResponseDone(2)
+	msgs := h.llm.Requests()[1].Messages
+	if msgs[1].Content != "Hello world. Second sentence here." {
+		t.Fatalf("a rejected truncate changed the item: %q", msgs[1].Content)
+	}
+}
