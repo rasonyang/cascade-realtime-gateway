@@ -19,10 +19,12 @@ import (
 // Name is the registry name of all three providers.
 const Name = "qwen"
 
-// DefaultHost is the Model Studio endpoint Cascade targets by default. Both
-// the HTTP and the WebSocket URL are derived from it and either can be
-// overridden per provider.
-const DefaultHost = "llm-REDACTED.cn-beijing.maas.aliyuncs.com"
+// DefaultHost is the public Model Studio endpoint Cascade targets by default.
+// Both the HTTP and the WebSocket URL are derived from it and either can be
+// overridden per provider (`options.base_url` for the LLM, `options.url` for
+// ASR and TTS) — which is how a dedicated Model Studio deployment, whose host
+// is account-specific, is pointed at.
+const DefaultHost = "dashscope.aliyuncs.com"
 
 const (
 	defaultLLMBaseURL = "https://" + DefaultHost + "/compatible-mode/v1"

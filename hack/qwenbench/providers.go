@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -15,8 +16,40 @@ import (
 
 // synthesize renders text to 24 kHz PCM with the real TTS so the ASR and
 // E2E benchmarks push genuine speech.
+// benchHostEnv names the optional host override. The qwen package defaults to
+// the public Model Studio endpoint; a dedicated deployment has an
+// account-specific host and a key issued for one is rejected by the other.
+const benchHostEnv = "QWEN_HOST"
+
+func benchLLMOptions() qwen.LLMOptions {
+	var o qwen.LLMOptions
+	if h := os.Getenv(benchHostEnv); h != "" {
+		o.BaseURL = "https://" + h + "/compatible-mode/v1"
+	}
+	return o
+}
+
+func benchWSURL() string {
+	if h := os.Getenv(benchHostEnv); h != "" {
+		return "wss://" + h + "/api-ws/v1/inference"
+	}
+	return ""
+}
+
+func benchASROptions() qwen.ASROptions {
+	var o qwen.ASROptions
+	o.URL = benchWSURL()
+	return o
+}
+
+func benchTTSOptions() qwen.TTSOptions {
+	var o qwen.TTSOptions
+	o.URL = benchWSURL()
+	return o
+}
+
 func synthesize(ctx context.Context, key, text string) ([]byte, error) {
-	s, err := qwen.NewTTS(key, qwen.TTSOptions{}).Synthesize(ctx, provider.TTSConfig{SampleRate: audio.SampleRate})
+	s, err := qwen.NewTTS(key, benchTTSOptions()).Synthesize(ctx, provider.TTSConfig{SampleRate: audio.SampleRate})
 	if err != nil {
 		return nil, err
 	}
@@ -46,7 +79,7 @@ func synthesize(ctx context.Context, key, text string) ([]byte, error) {
 // connection, which is the steady state a call runs in. The connection dial
 // is measured separately so cold connection cost never hides inside a turn.
 func benchASR(ctx context.Context, key string, pcm []byte, samples int, cap *logCapture) (section, error) {
-	asr := qwen.NewASR(key, qwen.ASROptions{})
+	asr := qwen.NewASR(key, benchASROptions())
 
 	coldDial := &series{Name: "connect (cold)"}
 	warmDial := &series{Name: "connect (warm)"}
@@ -206,13 +239,13 @@ func benchLLM(ctx context.Context, key string, samples int) (section, error) {
 	}
 
 	// Cold: a provider built for this one request, so nothing is pooled.
-	first, _, _, err := measure(qwen.NewLLM(key, qwen.LLMOptions{}))
+	first, _, _, err := measure(qwen.NewLLM(key, benchLLMOptions()))
 	if err != nil {
 		return section{}, err
 	}
 	cold.add(first)
 
-	l := qwen.NewLLM(key, qwen.LLMOptions{})
+	l := qwen.NewLLM(key, benchLLMOptions())
 	for i := 0; i < samples; i++ {
 		first, chunk, done, err := measure(l)
 		if err != nil {

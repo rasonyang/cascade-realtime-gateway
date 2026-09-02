@@ -1,9 +1,15 @@
 # Qwen provider latency
 
-Measured 2026-09-01 against the live Alibaba Cloud Model Studio endpoint
-`llm-REDACTED.cn-beijing.maas.aliyuncs.com` from a machine in China,
-with `hack/qwenbench`. Models: `qwen-audio-3.0-asr-flash-streaming`,
-`qwen3.6-flash`, `qwen-audio-3.0-tts-flash` (voice `longanlingxi`).
+Measured 2026-09-01 against a live Alibaba Cloud Model Studio endpoint from a
+machine in China, with `hack/qwenbench`. Models:
+`qwen-audio-3.0-asr-flash-streaming`, `qwen3.6-flash`,
+`qwen-audio-3.0-tts-flash` (voice `longanlingxi`).
+
+The numbers below came from a dedicated Model Studio deployment, whose host is
+account-specific; the package default is the public endpoint
+(`dashscope.aliyuncs.com`). Latency on the public endpoint has not been
+measured and will differ. Point a provider at a dedicated deployment with
+`options.base_url` (LLM) and `options.url` (ASR, TTS).
 
 Reproduce with:
 

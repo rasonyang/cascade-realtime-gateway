@@ -24,6 +24,36 @@ import (
 	"github.com/rasonyang/cascade-realtime-gateway/internal/provider"
 )
 
+// QwenHostEnv names the optional host override the live suite honours. The
+// package default is the public Model Studio endpoint; a dedicated Model
+// Studio deployment has an account-specific host, and a key issued for one
+// is rejected by the other with 401. Set it to run this suite against a
+// dedicated deployment:
+//
+//	QWEN_HOST=llm-….cn-beijing.maas.aliyuncs.com ALIYUN_API_KEY=… \
+//	  go test -tags qwenreal ./internal/provider/qwen
+const QwenHostEnv = "QWEN_HOST"
+
+func realLLMOptions() LLMOptions {
+	var o LLMOptions
+	if h := os.Getenv(QwenHostEnv); h != "" {
+		o.BaseURL = "https://" + h + "/compatible-mode/v1"
+	}
+	return o
+}
+
+func realWS() wsOptions {
+	var o wsOptions
+	if h := os.Getenv(QwenHostEnv); h != "" {
+		o.URL = "wss://" + h + "/api-ws/v1/inference"
+	}
+	return o
+}
+
+func realASROptions() ASROptions { return ASROptions{wsOptions: realWS()} }
+
+func realTTSOptions() TTSOptions { return TTSOptions{wsOptions: realWS()} }
+
 func realKey(t *testing.T) string {
 	t.Helper()
 	key := os.Getenv("ALIYUN_API_KEY")
@@ -46,7 +76,7 @@ var (
 func realSpeech(t *testing.T, key string) []byte {
 	t.Helper()
 	speechOnce.Do(func() {
-		tts := NewTTS(key, TTSOptions{})
+		tts := NewTTS(key, realTTSOptions())
 		s, err := tts.Synthesize(context.Background(), provider.TTSConfig{SampleRate: audio.SampleRate})
 		if err != nil {
 			speechErr = err
@@ -75,7 +105,7 @@ func realSpeech(t *testing.T, key string) []byte {
 
 func TestRealLLM(t *testing.T) {
 	key := realKey(t)
-	l := NewLLM(key, LLMOptions{})
+	l := NewLLM(key, realLLMOptions())
 	started := time.Now()
 	ch, err := l.Chat(context.Background(), provider.ChatRequest{
 		Instructions: "You are a concise voice assistant. Answer in one short sentence.",
@@ -125,7 +155,7 @@ func TestRealLLM(t *testing.T) {
 
 func TestRealTTS(t *testing.T) {
 	key := realKey(t)
-	tts := NewTTS(key, TTSOptions{})
+	tts := NewTTS(key, realTTSOptions())
 	if !tts.Capabilities().IncrementalText {
 		t.Fatal("IncrementalText capability lost")
 	}
@@ -186,7 +216,7 @@ func TestRealASRTwoTurnsOneConnection(t *testing.T) {
 	pcm := realSpeech(t, key)
 	t.Logf("fixture utterance: %d ms", audio.BytesToMs(len(pcm)))
 
-	asr := NewASR(key, ASROptions{})
+	asr := NewASR(key, realASROptions())
 	stream, err := asr.OpenStream(context.Background(), provider.ASRConfig{SampleRate: audio.SampleRate})
 	if err != nil {
 		t.Fatal(err)
@@ -280,7 +310,7 @@ func TestRealCascade(t *testing.T) {
 	pcm := realSpeech(t, key)
 
 	// --- ASR --------------------------------------------------------------
-	asr := NewASR(key, ASROptions{})
+	asr := NewASR(key, realASROptions())
 	stream, err := asr.OpenStream(context.Background(), provider.ASRConfig{SampleRate: audio.SampleRate})
 	if err != nil {
 		t.Fatal(err)
@@ -315,7 +345,7 @@ func TestRealCascade(t *testing.T) {
 	t.Logf("CASCADE transcript=%q", transcript)
 
 	// --- LLM --------------------------------------------------------------
-	ch, err := NewLLM(key, LLMOptions{}).Chat(context.Background(), provider.ChatRequest{
+	ch, err := NewLLM(key, realLLMOptions()).Chat(context.Background(), provider.ChatRequest{
 		Instructions: "You are a concise voice assistant. Answer in one short sentence.",
 		Messages:     []provider.Message{{Role: provider.RoleUser, Content: transcript}},
 	})
@@ -337,7 +367,7 @@ func TestRealCascade(t *testing.T) {
 	t.Logf("CASCADE answer=%q", answer.String())
 
 	// --- TTS --------------------------------------------------------------
-	out, err := NewTTS(key, TTSOptions{}).Synthesize(context.Background(), provider.TTSConfig{SampleRate: audio.SampleRate})
+	out, err := NewTTS(key, realTTSOptions()).Synthesize(context.Background(), provider.TTSConfig{SampleRate: audio.SampleRate})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -392,7 +422,7 @@ func TestRealLLMToolCall(t *testing.T) {
 	logRawToolStream(t, key, req)
 
 	// --- through the adapter -----------------------------------------------
-	ch, err := NewLLM(key, LLMOptions{}).Chat(context.Background(), req)
+	ch, err := NewLLM(key, realLLMOptions()).Chat(context.Background(), req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,7 +475,7 @@ func TestRealLLMToolCall(t *testing.T) {
 		provider.Message{Role: provider.RoleAssistant, Content: text.String(), ToolCalls: []provider.ToolCall{call}},
 		provider.Message{Role: provider.RoleTool, ToolCallID: call.ID,
 			Content: "No sales agent is available. Tell the caller and offer to take a message."})
-	ch2, err := NewLLM(key, LLMOptions{}).Chat(context.Background(), follow)
+	ch2, err := NewLLM(key, realLLMOptions()).Chat(context.Background(), follow)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -472,7 +502,7 @@ func TestRealLLMToolCall(t *testing.T) {
 // from the adapter's output.
 func logRawToolStream(t *testing.T, key string, req provider.ChatRequest) {
 	t.Helper()
-	l := NewLLM(key, LLMOptions{})
+	l := NewLLM(key, realLLMOptions())
 	body := chatRequest{
 		Model: l.opts.Model, Stream: true, StreamOptions: streamOptions{IncludeUsage: true},
 		EnableThinking: false, Tools: chatTools(req.Tools),

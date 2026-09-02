@@ -85,7 +85,7 @@ func TestE2EQwenAdminProfile(t *testing.T) {
 	// The secret stays an {env.NAME} placeholder: it is resolved when the
 	// provider is built, and the state file must keep it verbatim.
 	for _, p := range []struct{ name, role string }{{"qwen-asr", "asr"}, {"qwen-llm", "llm"}, {"qwen-tts", "tts"}} {
-		body := fmt.Sprintf(`{"name":%q,"type":"qwen","api_key":"{env.ALIYUN_API_KEY}"}`, p.name)
+		body := fmt.Sprintf(`{"name":%q,"type":"qwen","api_key":"{env.ALIYUN_API_KEY}"%s}`, p.name, qwenHostOptions(p.role))
 		if code, b := admWrite("PUT", "/providers/"+p.name, body); code != http.StatusOK {
 			t.Fatalf("PUT provider %s = %d %s", p.name, code, b)
 		}
@@ -290,7 +290,7 @@ func TestE2EQwenToolCall(t *testing.T) {
 		return w.Code, w.Body.Bytes()
 	}
 	for _, p := range []struct{ name, role string }{{"qwen-asr", "asr"}, {"qwen-llm", "llm"}, {"qwen-tts", "tts"}} {
-		body := fmt.Sprintf(`{"name":%q,"type":"qwen","api_key":"{env.ALIYUN_API_KEY}"}`, p.name)
+		body := fmt.Sprintf(`{"name":%q,"type":"qwen","api_key":"{env.ALIYUN_API_KEY}"%s}`, p.name, qwenHostOptions(p.role))
 		if code, b := admWrite("PUT", "/providers/"+p.name, body); code != http.StatusOK {
 			t.Fatalf("PUT provider %s = %d %s", p.name, code, b)
 		}
@@ -419,11 +419,31 @@ answered:
 	t.Log("STEP 4  a duplicate function_call_output is rejected on item.call_id")
 }
 
+// qwenHostOptions renders the options block that points a provider at the
+// Model Studio deployment the key belongs to. The qwen package defaults to
+// the public endpoint; a dedicated deployment has an account-specific host,
+// and a key issued for one is rejected by the other with 401. Set QWEN_HOST
+// to run these tests against a dedicated deployment.
+func qwenHostOptions(role string) string {
+	h := os.Getenv("QWEN_HOST")
+	if h == "" {
+		return ""
+	}
+	if role == "llm" {
+		return fmt.Sprintf(`,"options":{"base_url":"https://%s/compatible-mode/v1"}`, h)
+	}
+	return fmt.Sprintf(`,"options":{"url":"wss://%s/api-ws/v1/inference"}`, h)
+}
+
 // synthesizeQwen speaks text with the real Qwen TTS so the ASR has genuine
 // 24 kHz audio to transcribe.
 func synthesizeQwen(t *testing.T, text string) []byte {
 	t.Helper()
-	p, err := provider.New(provider.KindTTS, "qwen", os.Getenv("ALIYUN_API_KEY"), json.RawMessage(`{}`))
+	opts := json.RawMessage(`{}`)
+	if h := os.Getenv("QWEN_HOST"); h != "" {
+		opts = json.RawMessage(fmt.Sprintf(`{"url":"wss://%s/api-ws/v1/inference"}`, h))
+	}
+	p, err := provider.New(provider.KindTTS, "qwen", os.Getenv("ALIYUN_API_KEY"), opts)
 	if err != nil {
 		t.Fatal(err)
 	}
