@@ -22,8 +22,16 @@ type audioSegment struct {
 //     after the cut;
 //  2. segments present: keep whole segments that ended before the cut, and
 //     trim the straddling segment proportionally by rune count;
-//  3. no information: tier 2 with a single whole-response segment, which the
-//     pipeline records for incremental providers without alignment.
+//  3. no information: tier 2 with a single whole-response segment covering
+//     the whole response, synthesized here.
+//
+// Tier 3 is synthesized rather than supplied by the caller because the case
+// that needs it most is a response cancelled mid-stream — a barge-in, which
+// is the only time truncate is interesting. An incremental TTS provider
+// reports no per-sentence segments at all, and a cancelled response never
+// reaches the end of its TTS stage, so relying on the pipeline to record a
+// fallback segment left exactly that case with no segments and trimmed the
+// whole turn away.
 //
 // Invariants: the result is a prefix of text, monotonic in cutBytes, and
 // equals text when cutBytes >= totalAudioBytes.
@@ -36,6 +44,9 @@ func trimText(text string, segs []audioSegment, align []provider.CharTiming, cut
 	}
 	if len(align) > 0 {
 		return trimByAlignment(text, align, cutBytes)
+	}
+	if len(segs) == 0 {
+		segs = []audioSegment{{textStart: 0, textEnd: len(text), audioStart: 0, audioEnd: totalAudioBytes}}
 	}
 	return trimBySegments(text, segs, cutBytes)
 }

@@ -1100,17 +1100,12 @@ func (s *Session) handleResponseEvent(ev Event) {
 	case pipeTTSDone:
 		r.ttsDone = true
 		r.audioFlushed = true // deltas precede this event on the same channel
-		out, spoke := s.conv.get(r.item)
-		if r.ttsSpan != nil {
+		if out, spoke := s.conv.get(r.item); r.ttsSpan != nil {
 			if spoke {
 				r.ttsSpan.SetAttributes(attribute.Int("cascade.audio_ms", out.AudioMs))
 			}
 			r.ttsSpan.End()
 			r.ttsSpan = nil
-		}
-		if spoke && len(out.segments) == 0 && len(out.alignment) == 0 {
-			// Incremental provider without alignment: tier-3 single segment.
-			out.segments = []audioSegment{{textStart: 0, textEnd: len(out.Text), audioStart: 0, audioEnd: out.audioB}}
 		}
 		s.maybeComplete(r)
 	case pipeError:
