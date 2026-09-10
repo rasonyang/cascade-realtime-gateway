@@ -163,3 +163,7 @@ ALIYUN_API_KEY=... go test -tags e2e -run TestE2EQwen -v ./internal/server   # A
                                                                             # and function calling end to end
 ALIYUN_API_KEY=... go run ./hack/qwenbench -only e2e -turns 20               # gateway latency
 ```
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
