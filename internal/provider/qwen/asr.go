@@ -30,6 +30,10 @@ type ASROptions struct {
 	// The queue also absorbs the audio that arrives while a task is
 	// restarting, so nothing is dropped between turns.
 	AudioQueueFrames int `json:"audio_queue_frames"`
+	// KeepAliveInterval is how long a running task may go without audio
+	// before the writer sends a short frame of silence. DashScope fails a
+	// task 23 s after its last audio frame, so it must stay below that.
+	KeepAliveInterval config.Duration `json:"keepalive_interval"`
 }
 
 const (
@@ -38,6 +42,17 @@ const (
 	defaultAudioQueueFrames = 500 // 10 s of 20 ms frames
 	asrEventQueue           = 32
 	asrCtlQueue             = 8
+
+	// dashScopeNoAudioLimit is how long the service lets a recognition task
+	// run without an audio frame. When it expires the service ends the task
+	// itself, which with no audio fails as "SERVER_ERROR: DecodePost resample
+	// audio from 24000 to 16000 failed" and closes the socket with 1011.
+	// Measured on the live endpoint; not documented.
+	dashScopeNoAudioLimit    = 23 * time.Second
+	defaultKeepAliveInterval = 10 * time.Second
+	// keepAliveMs is the length of one keep-alive silence frame. Recognition
+	// is billed by audio duration, so it is kept as short as possible.
+	keepAliveMs = 20
 )
 
 func (o *ASROptions) applyDefaults() {
@@ -51,6 +66,16 @@ func (o *ASROptions) applyDefaults() {
 	if o.AudioQueueFrames == 0 {
 		o.AudioQueueFrames = defaultAudioQueueFrames
 	}
+	if o.KeepAliveInterval == 0 {
+		o.KeepAliveInterval = config.Duration(defaultKeepAliveInterval)
+	}
+}
+
+func (o *ASROptions) validate() error {
+	if ka := o.KeepAliveInterval.Std(); ka < 0 || ka >= dashScopeNoAudioLimit {
+		return fmt.Errorf("qwen asr options: keepalive_interval must be positive and below %s", dashScopeNoAudioLimit)
+	}
+	return nil
 }
 
 func init() {
@@ -60,6 +85,9 @@ func init() {
 			if err := json.Unmarshal(raw, &o); err != nil {
 				return nil, fmt.Errorf("qwen asr options: %w", err)
 			}
+		}
+		if err := o.validate(); err != nil {
+			return nil, err
 		}
 		return NewASR(apiKey, o), nil
 	})
@@ -114,6 +142,13 @@ type asrSentence struct {
 // the same connection for ~25 ms. Audio that arrives while a task is
 // restarting waits in the queue, so no audio is ever sent before
 // task-started and none is dropped.
+//
+// Silence handling: DashScope fails a task that receives no audio for 23 s
+// and also fails a finish-task on a task that received none, both with a
+// misleading resample error that closes the socket. The writer therefore
+// sends a keep-alive silence frame after keepalive_interval without audio,
+// and a Finalize on a task that has received nothing is answered with a
+// synthesized EndOfTurn instead of a finish-task.
 func (a *ASR) OpenStream(ctx context.Context, cfg provider.ASRConfig) (provider.ASRStream, error) {
 	conn, err := dial(ctx, a.opts.wsOptions, a.apiKey)
 	if err != nil {
@@ -145,6 +180,8 @@ func (a *ASR) OpenStream(ctx context.Context, cfg provider.ASRConfig) (provider.
 		closeSent:  make(chan struct{}),
 		openedAt:   time.Now(),
 	}
+	// Armed for the first run-task, which the writer sends immediately.
+	s.ack = time.AfterFunc(a.opts.IdleTimeout.Std(), scancel)
 	slog.Debug("qwen asr stream opened", "provider", Name, "model", s.model, "sample_rate", rate)
 	go s.reader()
 	go s.writer()
@@ -183,13 +220,26 @@ type asrStream struct {
 	// reader can report how long the service took to acknowledge it.
 	runAtNanos atomic.Int64
 
+	// ack bounds the wait for task-started after each run-task (idle_timeout).
+	// It is not armed while a task runs: a silent caller legitimately
+	// produces no inbound frames for as long as the silence lasts.
+	ack *time.Timer
+
 	// currentTask is written by the writer before run-task and read by the
 	// reader for logging; guarded because both goroutines touch it.
 	mu          sync.Mutex
 	currentTask string
 	finalizeAt  time.Time
 	closed      bool
+	// gaps are the keep-alive silence frames inserted into the current task,
+	// on the service's timeline, so result offsets can be mapped back onto
+	// the pushed-audio timeline.
+	gaps []silenceGap
 }
+
+// silenceGap is one keep-alive frame: at is its offset in the task's audio
+// as the service sees it, ms its length.
+type silenceGap struct{ at, ms int }
 
 // PushAudio implements provider.ASRStream; it never blocks on the network.
 func (s *asrStream) PushAudio(pcm []byte) error {
@@ -267,9 +317,22 @@ func (s *asrStream) writer() {
 		finalizing bool
 		pending    bool // Finalize arrived before task-started
 		sentMs     int  // audio milliseconds written in the current task
+		padMs      int  // keep-alive silence milliseconds written in the current task
 		deadline   <-chan time.Time
 		timer      *time.Timer
 	)
+	keepAliveEvery := s.opts.KeepAliveInterval.Std()
+	keepAlive := time.NewTimer(keepAliveEvery)
+	defer keepAlive.Stop()
+	silence := make([]byte, s.params.SampleRate*2*keepAliveMs/1000)
+	writeAudio := func(pcm []byte) bool {
+		if s.conn.Write(s.ctx, websocket.MessageBinary, pcm) != nil {
+			return false
+		}
+		sentMs += audio.BytesToMs(len(pcm))
+		keepAlive.Reset(keepAliveEvery)
+		return true
+	}
 	stopTimer := func() {
 		if timer != nil {
 			timer.Stop()
@@ -284,14 +347,20 @@ func (s *asrStream) writer() {
 		for {
 			select {
 			case pcm := <-s.in:
-				if s.conn.Write(s.ctx, websocket.MessageBinary, pcm) != nil {
+				if !writeAudio(pcm) {
 					return false
 				}
-				sentMs += audio.BytesToMs(len(pcm))
 				continue
 			default:
 			}
 			break
+		}
+		if sentMs+padMs == 0 {
+			// Nothing reached this task, so there is nothing to flush, and
+			// DashScope fails a finish-task on an empty task. Honor the
+			// contract directly and keep the task running.
+			pending = false
+			return s.emit(provider.ASREvent{Kind: provider.ASREndOfTurn})
 		}
 		if !s.sendFinish() {
 			return false
@@ -306,8 +375,11 @@ func (s *asrStream) writer() {
 	}
 	restart := func() bool {
 		stopTimer()
+		s.mu.Lock()
 		s.baseMs.Add(int64(sentMs))
-		sentMs = 0
+		s.gaps = nil
+		s.mu.Unlock()
+		sentMs, padMs = 0, 0
 		started, finalizing, pending = false, false, false
 		return s.sendRun()
 	}
@@ -318,9 +390,13 @@ func (s *asrStream) writer() {
 	for {
 		// A nil channel blocks forever, which is exactly the gate: audio is
 		// written only while a task is running and not being finalized.
-		var audioCh chan []byte
+		var (
+			audioCh     chan []byte
+			keepAliveCh <-chan time.Time
+		)
 		if started && !finalizing {
 			audioCh = s.in
+			keepAliveCh = keepAlive.C
 		}
 		select {
 		case <-s.ctx.Done():
@@ -338,6 +414,7 @@ func (s *asrStream) writer() {
 			switch h.Event {
 			case eventTaskStarted:
 				started = true
+				keepAlive.Reset(keepAliveEvery)
 				if pending && !beginFinalize() {
 					return
 				}
@@ -376,10 +453,21 @@ func (s *asrStream) writer() {
 			}
 
 		case pcm := <-audioCh:
-			if s.conn.Write(s.ctx, websocket.MessageBinary, pcm) != nil {
+			if !writeAudio(pcm) {
 				return
 			}
-			sentMs += audio.BytesToMs(len(pcm))
+
+		case <-keepAliveCh:
+			// No audio for keepalive_interval: the caller is silent or on
+			// hold. One short silence frame keeps the task alive.
+			if s.conn.Write(s.ctx, websocket.MessageBinary, silence) != nil {
+				return
+			}
+			s.mu.Lock()
+			s.gaps = append(s.gaps, silenceGap{at: sentMs + padMs, ms: keepAliveMs})
+			s.mu.Unlock()
+			padMs += keepAliveMs
+			keepAlive.Reset(keepAliveEvery)
 		}
 	}
 }
@@ -390,6 +478,7 @@ func (s *asrStream) sendRun() bool {
 	s.currentTask = id
 	s.mu.Unlock()
 	s.runAtNanos.Store(time.Now().UnixNano())
+	s.ack.Reset(s.opts.IdleTimeout.Std())
 	frame := runFrame[asrParameters]{
 		Header: newOutHeader(actionRunTask, id),
 		Payload: runPayload[asrParameters]{
@@ -425,8 +514,7 @@ func (s *asrStream) reader() {
 		slog.Debug("qwen asr stream closed", "provider", Name, "reason", reason, "lifetime_ms", time.Since(s.openedAt).Milliseconds())
 	}()
 
-	idle := time.AfterFunc(s.opts.IdleTimeout.Std(), s.cancel)
-	defer idle.Stop()
+	defer s.ack.Stop()
 	for {
 		typ, data, err := s.conn.Read(s.ctx)
 		if err != nil {
@@ -441,7 +529,6 @@ func (s *asrStream) reader() {
 			s.emit(provider.ASREvent{Kind: provider.ASRError, Err: transientf("connection closed: %v", err)})
 			return
 		}
-		idle.Reset(s.opts.IdleTimeout.Std())
 		if typ != websocket.MessageText {
 			continue // recognition never sends binary frames
 		}
@@ -480,6 +567,7 @@ func (s *asrStream) handle(h inHeader, payload json.RawMessage) bool {
 		return s.emitSentence(res.Output.Sentence)
 
 	case eventTaskStarted:
+		s.ack.Stop()
 		if at := s.runAtNanos.Load(); at != 0 {
 			slog.Debug("qwen asr task started", "provider", Name,
 				"started_ms", time.Since(time.Unix(0, at)).Seconds()*1000)
@@ -511,10 +599,10 @@ func (s *asrStream) emitSentence(sn *asrSentence) bool {
 	base := int(s.baseMs.Load())
 	ev := provider.ASREvent{Text: sn.Text, StartMs: base, EndMs: base}
 	if sn.BeginTime != nil {
-		ev.StartMs = base + *sn.BeginTime
+		ev.StartMs = base + s.unpad(*sn.BeginTime)
 	}
 	if sn.EndTime != nil {
-		ev.EndMs = base + *sn.EndTime
+		ev.EndMs = base + s.unpad(*sn.EndTime)
 	}
 	if sn.SentenceEnd {
 		ev.Kind = provider.ASRFinal
@@ -523,6 +611,25 @@ func (s *asrStream) emitSentence(sn *asrSentence) bool {
 		ev.EndMs = ev.StartMs
 	}
 	return s.emit(ev)
+}
+
+// unpad maps an offset on the service's task timeline, which includes
+// keep-alive silence, onto the pushed-audio timeline. An offset inside a
+// keep-alive frame maps to where that frame was inserted.
+func (s *asrStream) unpad(ms int) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	shift := 0
+	for _, g := range s.gaps {
+		if ms <= g.at {
+			break
+		}
+		if ms < g.at+g.ms {
+			return g.at - shift
+		}
+		shift += g.ms
+	}
+	return ms - shift
 }
 
 // toWriter hands a lifecycle frame to the writer's state machine.

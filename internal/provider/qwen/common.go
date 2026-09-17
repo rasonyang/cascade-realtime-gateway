@@ -46,7 +46,9 @@ type wsOptions struct {
 	URL            string          `json:"url"`
 	ConnectTimeout config.Duration `json:"connect_timeout"`
 	// IdleTimeout bounds the gap between inbound frames once a task is
-	// running; exceeding it tears the socket down.
+	// running; exceeding it tears the socket down. ASR applies it only to
+	// the wait for task-started, because a silent caller produces no
+	// inbound frames for as long as the silence lasts.
 	IdleTimeout config.Duration `json:"idle_timeout"`
 }
 

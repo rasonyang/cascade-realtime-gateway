@@ -47,8 +47,17 @@ type fakeWS struct {
 	// onAudio scripts the reply to each inbound binary frame; total is the
 	// cumulative byte count.
 	onAudio func(total int) []reply
+	// noAudioLimit, when set, emulates DashScope's no-audio limit: a task
+	// that receives no audio frame for this long fails with the service's
+	// resample error and the socket is closed with 1011.
+	noAudioLimit time.Duration
 
 	mu sync.Mutex
+	// lastAudio is when the running task last received audio (or started);
+	// taskAudio is the audio bytes the running task has received.
+	lastAudio time.Time
+	taskAudio int
+	running   string
 	// startedTasks are the task ids the fake has acknowledged.
 	startedTasks     []string
 	frames           []recordedFrame
@@ -106,6 +115,37 @@ func newFakeWS(t *testing.T) (*fakeWS, *httptest.Server) {
 			}
 		}()
 		defer func() { close(out); <-done }()
+		if f.noAudioLimit > 0 {
+			stop := make(chan struct{})
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				tick := time.NewTicker(5 * time.Millisecond)
+				defer tick.Stop()
+				for {
+					select {
+					case <-stop:
+						return
+					case <-tick.C:
+					}
+					f.mu.Lock()
+					id, expired := f.running, f.running != "" && time.Since(f.lastAudio) > f.noAudioLimit
+					f.mu.Unlock()
+					if !expired {
+						continue
+					}
+					for _, rp := range []reply{silenceLimitFailure(id), closeWith(websocket.StatusInternalError)} {
+						select {
+						case out <- rp:
+						case <-done:
+						}
+					}
+					return
+				}
+			}()
+			defer func() { close(stop); wg.Wait() }()
+		}
 		for {
 			typ, data, err := conn.Read(ctx)
 			if err != nil {
@@ -118,6 +158,8 @@ func newFakeWS(t *testing.T) (*fakeWS, *httptest.Server) {
 			if typ == websocket.MessageBinary {
 				f.mu.Lock()
 				f.audioBytes += len(data)
+				f.taskAudio += len(data)
+				f.lastAudio = time.Now()
 				if len(f.startedTasks) == 0 {
 					f.audioBeforeStart += len(data)
 				}
@@ -130,6 +172,12 @@ func newFakeWS(t *testing.T) (*fakeWS, *httptest.Server) {
 				rec := parseFrame(data)
 				f.mu.Lock()
 				f.frames = append(f.frames, rec)
+				switch rec.Action {
+				case actionRunTask:
+					f.running, f.taskAudio, f.lastAudio = rec.TaskID, 0, time.Now()
+				case actionFinishTask:
+					f.running = ""
+				}
 				f.mu.Unlock()
 				if f.onFrame != nil {
 					replies = f.onFrame(rec)
@@ -228,6 +276,19 @@ func asrSentenceFrame(taskID, sentence string, beginMs, endMs int, final bool) r
 
 func taskFinishedFrame(taskID string) reply {
 	return text(`{"header":{"task_id":"` + taskID + `","event":"task-finished"},"payload":{"output":{}}}`)
+}
+
+// silenceLimitFailure is what DashScope sends when a recognition task ends
+// with no audio: on its no-audio limit, or on a finish-task.
+func silenceLimitFailure(taskID string) reply {
+	return taskFailedFrame(taskID, "SERVER_ERROR", "DecodePost resample audio from 24000 to 16000 failed")
+}
+
+// currentTaskAudio reports the audio bytes the running task has received.
+func (f *fakeWS) currentTaskAudio() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.taskAudio
 }
 
 func taskFailedFrame(taskID, code, msg string) reply {

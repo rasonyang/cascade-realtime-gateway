@@ -269,6 +269,12 @@ func TestASRFinalizeTimeout(t *testing.T) {
 		o.FinalizeTimeout = config.Duration(150 * time.Millisecond)
 	})
 	waitFor(t, func() bool { return countAction(f, actionRunTask) == 1 }, "the first run-task")
+	// The task needs audio: an empty task is finalized without finish-task.
+	frame := make([]byte, audio.MsToBytes(100))
+	if err := s.PushAudio(frame); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { _, total, _ := f.snapshot(); return total >= len(frame) }, "audio to reach the service")
 	if err := s.Finalize(); err != nil {
 		t.Fatal(err)
 	}
@@ -277,6 +283,129 @@ func TestASRFinalizeTimeout(t *testing.T) {
 		t.Fatalf("event = %+v, want a synthesized end_of_turn", ev)
 	}
 	waitFor(t, func() bool { return countAction(f, actionRunTask) == 2 }, "the task to restart after the timeout")
+}
+
+// TestASRSilentCallerSurvivesNoAudioLimit: a caller that sends no audio (on
+// hold, RTP stopped) must not hit DashScope's no-audio limit. Without the
+// keep-alive the fake fails the task exactly as the live service does.
+func TestASRSilentCallerSurvivesNoAudioLimit(t *testing.T) {
+	f, srv := newFakeWS(t)
+	defer srv.Close()
+	f.noAudioLimit = 150 * time.Millisecond
+	f.onFrame = func(fr recordedFrame) []reply {
+		switch fr.Action {
+		case actionRunTask:
+			return []reply{f.ackStarted(fr.TaskID)}
+		case actionFinishTask:
+			return []reply{asrSentenceFrame(fr.TaskID, "after hold", 0, 100, true), taskFinishedFrame(fr.TaskID)}
+		}
+		return nil
+	}
+	s := openASR(t, f, wsURL(srv), func(o *ASROptions) {
+		o.KeepAliveInterval = config.Duration(50 * time.Millisecond)
+		// Shorter than the silence: a running task that is merely quiet
+		// must not be torn down for want of inbound frames.
+		o.IdleTimeout = config.Duration(200 * time.Millisecond)
+	})
+
+	select {
+	case ev, ok := <-s.Events():
+		t.Fatalf("event during silence = %+v (open=%v), want none", ev, ok)
+	case <-time.After(600 * time.Millisecond):
+	}
+	_, total, _ := f.snapshot()
+	if total == 0 || total%audio.MsToBytes(keepAliveMs) != 0 {
+		t.Errorf("keep-alive audio = %d bytes, want whole %d ms silence frames", total, keepAliveMs)
+	}
+	if n := countAction(f, actionRunTask); n != 1 {
+		t.Errorf("run-task count = %d, want 1: keep-alive must not restart the task", n)
+	}
+
+	// The stream still carries a normal turn afterwards.
+	if err := s.PushAudio(make([]byte, audio.MsToBytes(100))); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	if ev, _ := nextEvent(t, s); ev.Kind != provider.ASRFinal || ev.Text != "after hold" {
+		t.Fatalf("event = %+v, want the final transcript", ev)
+	}
+	if ev, _ := nextEvent(t, s); ev.Kind != provider.ASREndOfTurn {
+		t.Fatalf("event = %+v, want end_of_turn", ev)
+	}
+}
+
+// TestASRKeepAliveOffsets: keep-alive silence is on the service's timeline
+// but not on the pushed-audio timeline, so result offsets exclude it.
+func TestASRKeepAliveOffsets(t *testing.T) {
+	f, srv := newFakeWS(t)
+	defer srv.Close()
+	f.onFrame = func(fr recordedFrame) []reply {
+		switch fr.Action {
+		case actionRunTask:
+			return []reply{f.ackStarted(fr.TaskID)}
+		case actionFinishTask:
+			// The service saw 20 ms of keep-alive silence, then 100 ms of speech.
+			return []reply{asrSentenceFrame(fr.TaskID, "speech", 20, 120, true), taskFinishedFrame(fr.TaskID)}
+		}
+		return nil
+	}
+	s := openASR(t, f, wsURL(srv), func(o *ASROptions) {
+		o.KeepAliveInterval = config.Duration(300 * time.Millisecond)
+	})
+	keepAlive := audio.MsToBytes(keepAliveMs)
+	waitFor(t, func() bool { _, total, _ := f.snapshot(); return total >= keepAlive }, "one keep-alive frame")
+	frame := make([]byte, audio.MsToBytes(100))
+	if err := s.PushAudio(frame); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { _, total, _ := f.snapshot(); return total >= keepAlive+len(frame) }, "audio to reach the service")
+	if err := s.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	ev, _ := nextEvent(t, s)
+	if ev.Kind != provider.ASRFinal {
+		t.Fatalf("event = %+v, want final", ev)
+	}
+	if ev.StartMs != 0 || ev.EndMs != 100 {
+		t.Errorf("offsets = %d..%d, want 0..100 on the pushed-audio timeline", ev.StartMs, ev.EndMs)
+	}
+}
+
+// TestASRFinalizeEmptyTask: DashScope fails a finish-task on a task that
+// received no audio, so Finalize answers it with EndOfTurn and keeps the task.
+func TestASRFinalizeEmptyTask(t *testing.T) {
+	f, srv := newFakeWS(t)
+	defer srv.Close()
+	f.onFrame = func(fr recordedFrame) []reply {
+		switch fr.Action {
+		case actionRunTask:
+			return []reply{f.ackStarted(fr.TaskID)}
+		case actionFinishTask:
+			if f.currentTaskAudio() == 0 {
+				return []reply{silenceLimitFailure(fr.TaskID), closeWith(websocket.StatusInternalError)}
+			}
+			return []reply{taskFinishedFrame(fr.TaskID)}
+		}
+		return nil
+	}
+	s := openASR(t, f, wsURL(srv), nil)
+	waitFor(t, func() bool { f.mu.Lock(); defer f.mu.Unlock(); return len(f.startedTasks) == 1 }, "task-started")
+	for i := 0; i < 2; i++ {
+		if err := s.Finalize(); err != nil {
+			t.Fatal(err)
+		}
+		if ev, _ := nextEvent(t, s); ev.Kind != provider.ASREndOfTurn {
+			t.Fatalf("finalize %d: event = %+v, want end_of_turn", i, ev)
+		}
+	}
+	if n := countAction(f, actionFinishTask); n != 0 {
+		t.Errorf("finish-task count = %d, want 0 for an empty task", n)
+	}
+	if n := countAction(f, actionRunTask); n != 1 {
+		t.Errorf("run-task count = %d, want 1: the running task is kept", n)
+	}
 }
 
 func TestASRTaskFailed(t *testing.T) {
@@ -461,6 +590,20 @@ func TestASROptionsDefaults(t *testing.T) {
 	}
 	if o.FinalizeTimeout == 0 || o.AudioQueueFrames == 0 || o.ConnectTimeout == 0 || o.IdleTimeout == 0 {
 		t.Errorf("defaults left a zero value: %+v", o)
+	}
+	if ka := o.KeepAliveInterval.Std(); ka <= 0 || ka >= dashScopeNoAudioLimit {
+		t.Errorf("keepalive_interval default = %s, want within (0, %s)", ka, dashScopeNoAudioLimit)
+	}
+}
+
+func TestASRKeepAliveIntervalValidated(t *testing.T) {
+	for _, raw := range []string{`{"keepalive_interval":"23s"}`, `{"keepalive_interval":"-1s"}`} {
+		if _, err := provider.New(provider.KindASR, Name, "k", json.RawMessage(raw)); err == nil {
+			t.Errorf("options %s accepted, want an error", raw)
+		}
+	}
+	if _, err := provider.New(provider.KindASR, Name, "k", json.RawMessage(`{"keepalive_interval":"15s"}`)); err != nil {
+		t.Errorf("keepalive_interval 15s rejected: %v", err)
 	}
 }
 
