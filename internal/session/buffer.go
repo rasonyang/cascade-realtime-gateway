@@ -13,10 +13,13 @@ var errBufferOverflow = errors.New("input audio buffer overflow")
 // is the total audio ever appended, and never resets on clear or commit.
 //
 // VAD offsets are relative to baseMs because the detector is reset whenever
-// the buffer is cleared or committed.
+// the buffer is cleared or committed. In VAD modes the buffer may drop idle
+// audio from its head (trimIdle), so pcm[0] sits at headMs >= baseMs; the
+// timeline itself never shifts.
 type inputAudioBuffer struct {
 	pcm      []byte
-	baseMs   int // timeline offset of pcm[0]
+	baseMs   int // timeline offset the VAD's relative offsets are measured from
+	headMs   int // timeline offset of pcm[0]
 	maxBytes int
 
 	// Speech segment marked by VAD, absolute timeline ms; -1 when unset.
@@ -38,17 +41,17 @@ func (b *inputAudioBuffer) append(pcm []byte) error {
 }
 
 // totalMs is the current position on the session timeline.
-func (b *inputAudioBuffer) totalMs() int { return b.baseMs + audio.BytesToMs(len(b.pcm)) }
+func (b *inputAudioBuffer) totalMs() int { return b.headMs + audio.BytesToMs(len(b.pcm)) }
 
 func (b *inputAudioBuffer) len() int { return len(b.pcm) }
 
 // markSpeechStart records a VAD speech start at offsetMs (relative to the
-// buffer start), rolled back by prefixPaddingMs but never before the buffer
-// start. It returns the resulting audio_start_ms.
+// VAD origin), rolled back by prefixPaddingMs but never before the audio
+// still held. It returns the resulting audio_start_ms.
 func (b *inputAudioBuffer) markSpeechStart(offsetMs, prefixPaddingMs int) int {
 	start := b.baseMs + offsetMs - prefixPaddingMs
-	if start < b.baseMs {
-		start = b.baseMs
+	if start < b.headMs {
+		start = b.headMs
 	}
 	b.segStartMs = start
 	b.segEndMs = -1
@@ -73,15 +76,15 @@ func (b *inputAudioBuffer) commit() (pcm []byte, startMs, endMs int, ok bool) {
 	if len(b.pcm) == 0 {
 		return nil, 0, 0, false
 	}
-	startMs, endMs = b.baseMs, b.totalMs()
+	startMs, endMs = b.headMs, b.totalMs()
 	if b.segStartMs >= 0 {
 		startMs = b.segStartMs
 	}
 	if b.segEndMs >= 0 && b.segEndMs > startMs {
 		endMs = b.segEndMs
 	}
-	from := audio.MsToBytes(startMs - b.baseMs)
-	to := audio.MsToBytes(endMs - b.baseMs)
+	from := audio.MsToBytes(startMs - b.headMs)
+	to := audio.MsToBytes(endMs - b.headMs)
 	if to > len(b.pcm) {
 		to = len(b.pcm)
 	}
@@ -94,7 +97,28 @@ func (b *inputAudioBuffer) commit() (pcm []byte, startMs, endMs int, ok bool) {
 // position.
 func (b *inputAudioBuffer) clear() {
 	b.baseMs = b.totalMs()
+	b.headMs = b.baseMs
 	b.pcm = nil
 	b.segStartMs = -1
 	b.segEndMs = -1
+}
+
+// trimIdle drops audio older than keepMs from the head of the buffer while no
+// speech segment is marked. Only VAD modes call it: there, idle audio before
+// the prefix-padding window can never be part of a commit, so a caller that
+// stays silent (e.g. on hold) must not run into the memory cap. The timeline
+// and the VAD origin are unchanged. A marked segment is never trimmed, so an
+// over-long speech still overflows.
+func (b *inputAudioBuffer) trimIdle(keepMs int) {
+	if b.segStartMs >= 0 {
+		return
+	}
+	drop := audio.BytesToMs(len(b.pcm)) - keepMs
+	if drop <= 0 {
+		return
+	}
+	// Reslicing is O(1); the next append that outgrows the capacity copies
+	// only the live tail, which releases the dropped head.
+	b.pcm = b.pcm[audio.MsToBytes(drop):]
+	b.headMs += drop
 }

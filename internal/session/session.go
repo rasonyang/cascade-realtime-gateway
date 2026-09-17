@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -124,6 +125,13 @@ type Session struct {
 	asrWait      <-chan time.Time
 	eotTimer     *time.Timer
 	eot          <-chan time.Time
+
+	// semantic_vad deferred trigger: the committed item whose transcript
+	// decides whether a response is created, and the bounded wait for it.
+	deferItem      ItemRef
+	deferAnchor    time.Time
+	deferWaitTimer *time.Timer
+	deferWait      <-chan time.Time
 
 	pipelines sync.WaitGroup
 	startedAt time.Time
@@ -330,6 +338,9 @@ func (s *Session) run() {
 		case <-s.eot:
 			s.eot = nil
 			s.apply(s.turns.Step(asrEndOfTurn{}), "")
+		case <-s.deferWait:
+			s.deferWait = nil
+			s.handleDeferredTimeout()
 		}
 	}
 }
@@ -448,6 +459,7 @@ func (s *Session) stopTimers() {
 		s.asrWait = nil
 	}
 	s.disarmEndOfTurn()
+	s.dropDeferredTrigger()
 }
 
 // ---- configuration ---------------------------------------------------------
@@ -755,6 +767,12 @@ func (s *Session) handleAudio(pcm []byte) {
 				s.interruptAt = time.Now()
 				s.interrupt(ReasonTurnDetected)
 			}
+			if d.EmitSpeechStarted && s.turns.interruptResponse && s.deferItem != 0 {
+				// The equivalent of interrupting an awaiting response: the
+				// user resumed before the previous turn's transcript was in.
+				s.log.Debug("deferred response dropped: speech resumed", "item", s.deferItem)
+				s.dropDeferredTrigger()
+			}
 			s.apply(d, "")
 		case vad.SpeechEnd:
 			endMs := s.buffer.markSpeechEnd(ev.OffsetMs, s.vadSilenceMs())
@@ -766,6 +784,11 @@ func (s *Session) handleAudio(pcm []byte) {
 			s.apply(d, "")
 		}
 	}
+	// Idle audio before the prefix-padding window can never be committed;
+	// drop it so a long silence does not reach the memory cap. The extra
+	// frame covers the detector's pending partial frame, whose speech start
+	// may be reported at an offset up to one frame before the current end.
+	s.buffer.trimIdle(s.vadPrefixMs() + vad.FrameMs)
 }
 
 // apply executes a TurnDecision's commit / trigger / timer parts. Speech
@@ -773,10 +796,15 @@ func (s *Session) handleAudio(pcm []byte) {
 // millisecond values.
 func (s *Session) apply(d TurnDecision, tag string) {
 	if d.ArmEndOfTurnTimer {
-		s.armEndOfTurn()
+		s.armEndOfTurn(time.Duration(s.eagernessMs()) * time.Millisecond)
+	}
+	if d.ArmFinalWaitTimer {
+		s.armEndOfTurn(s.finalWait())
 	}
 	if d.Commit {
-		s.commit(tag)
+		if s.commit(tag) && d.DeferTrigger {
+			s.deferTrigger()
+		}
 	}
 	if d.Trigger {
 		if s.active != nil {
@@ -789,12 +817,13 @@ func (s *Session) apply(d TurnDecision, tag string) {
 	}
 }
 
-func (s *Session) commit(tag string) {
+// commit reports whether an item was committed.
+func (s *Session) commit(tag string) bool {
 	pcm, startMs, endMs, ok := s.buffer.commit()
 	if !ok {
 		// PROTOCOL-VERIFY: GA may enforce a minimum buffer duration; Phase 2.
 		s.emitError(tag, ErrCodeBufferEmpty, "input audio buffer is empty")
-		return
+		return false
 	}
 	_ = pcm // raw audio is not retained; the ASR stream already received it
 	if s.detector != nil {
@@ -821,13 +850,94 @@ func (s *Session) commit(tag string) {
 	s.emit(EvItemAdded{Item: it.snapshot(), PreviousItem: prev})
 	if err := s.asrStream.Finalize(); err != nil {
 		s.fatal(ErrCodeProviderError, "asr finalize: "+err.Error(), CloseProviderError)
+		return false
+	}
+	return true
+}
+
+// deferTrigger records that the item just committed decides the response:
+// semantic_vad creates it once that transcript is final and non-empty
+// (resolveDeferredTrigger), bounded by asr_final_timeout.
+func (s *Session) deferTrigger() {
+	it := s.pendingItem
+	if it == nil {
+		return
+	}
+	s.dropDeferredTrigger()
+	s.deferItem = it.Ref
+	s.deferAnchor = s.committedAt
+	s.deferWaitTimer = time.NewTimer(s.limits.ASRFinalTimeout.Std())
+	s.deferWait = s.deferWaitTimer.C
+}
+
+func (s *Session) dropDeferredTrigger() {
+	if s.deferWaitTimer != nil {
+		s.deferWaitTimer.Stop()
+		s.deferWaitTimer = nil
+	}
+	s.deferWait = nil
+	s.deferItem = 0
+	s.deferAnchor = time.Time{}
+}
+
+// resolveDeferredTrigger runs when ref's transcript is final. An empty
+// transcript is non-speech noise: the turn ends with no response.
+func (s *Session) resolveDeferredTrigger(ref ItemRef, text string) {
+	if s.deferItem == 0 || s.deferItem != ref {
+		return
+	}
+	anchor := s.deferAnchor
+	s.dropDeferredTrigger()
+	if strings.TrimSpace(text) == "" {
+		s.log.Info("no response: turn transcript is empty", "item", ref)
+		return
+	}
+	if s.active != nil {
+		s.log.Debug("auto trigger skipped: response in progress")
+		return
+	}
+	s.createResponseAt(ResponseOverrides{}, "", anchor)
+}
+
+// handleDeferredTimeout is asr_final_timeout for a deferred trigger. A
+// Partial still starts the response; with nothing heard there is no
+// response and no error, since nothing was said.
+func (s *Session) handleDeferredTimeout() {
+	ref, anchor := s.deferItem, s.deferAnchor
+	s.dropDeferredTrigger()
+	it := s.pendingItem
+	if ref == 0 || it == nil || it.Ref != ref {
+		return
+	}
+	best := joinTranscript(s.transcriptAcc, s.partial)
+	if strings.TrimSpace(best) == "" {
+		s.log.Warn("asr final timeout with no transcript; no response for this turn", "item", ref)
+		return
+	}
+	if s.active != nil {
+		s.log.Debug("auto trigger skipped: response in progress")
+		return
+	}
+	s.log.Warn("asr final timeout; starting with partial transcript", "item", ref)
+	it.Text = best
+	s.createResponseAt(ResponseOverrides{}, "", anchor)
+	if r := s.active; r != nil && r.awaiting {
+		s.stopASRWait()
+		s.startPipeline(r)
 	}
 }
 
-func (s *Session) armEndOfTurn() {
+func (s *Session) armEndOfTurn(d time.Duration) {
 	s.disarmEndOfTurn()
-	s.eotTimer = time.NewTimer(time.Duration(s.eagernessMs()) * time.Millisecond)
+	s.eotTimer = time.NewTimer(d)
 	s.eot = s.eotTimer.C
+}
+
+// finalWait bounds how long semantic_vad waits after speech_stopped for a
+// Final to judge: asr_final_timeout, but never shorter than the eagerness
+// delay a Final without punctuation would get.
+func (s *Session) finalWait() time.Duration {
+	return max(s.limits.ASRFinalTimeout.Std(), time.Duration(s.eagernessMs())*time.Millisecond)
 }
 
 func (s *Session) disarmEndOfTurn() {
@@ -904,6 +1014,7 @@ func (s *Session) completePendingItem(text, delta string) {
 		s.stopASRWait()
 		s.startPipeline(r)
 	}
+	s.resolveDeferredTrigger(it.Ref, text)
 }
 
 func (s *Session) handleTranscriptTimeout() {
@@ -935,6 +1046,12 @@ func (s *Session) stopASRWait() {
 // ---- responses -------------------------------------------------------------
 
 func (s *Session) createResponse(ov ResponseOverrides, tag string) {
+	s.createResponseAt(ov, tag, time.Time{})
+}
+
+// createResponseAt is createResponse with an explicit E2E latency anchor; a
+// zero anchor uses the pending commit, or now.
+func (s *Session) createResponseAt(ov ResponseOverrides, tag string, anchor time.Time) {
 	probe := s.cfg.Clone()
 	if ov.OutputModalities != nil {
 		probe.OutputModalities = ov.OutputModalities
@@ -966,7 +1083,9 @@ func (s *Session) createResponse(ov ResponseOverrides, tag string) {
 		tools:        toolDefs(s.cfg.Tools),
 		toolChoice:   toolChoice(s.cfg.ToolChoice),
 	}
-	if p := s.pendingItem; p != nil && !s.committedAt.IsZero() {
+	if !anchor.IsZero() {
+		r.anchorAt = anchor
+	} else if p := s.pendingItem; p != nil && !s.committedAt.IsZero() {
 		r.anchorAt = s.committedAt // E2E latency starts at the user's turn end
 	}
 	r.ctx, r.span = s.tel.Tracer.Start(s.ctx, "response", trace.WithAttributes(

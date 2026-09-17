@@ -362,6 +362,235 @@ func TestBufferOverflowClosesSession(t *testing.T) {
 	}
 }
 
+// A caller on hold streams silence far past the buffer cap; in a VAD mode
+// the idle head is trimmed, and a later turn keeps session-timeline offsets.
+func TestLongSilenceServerVADDoesNotOverflow(t *testing.T) {
+	h := newHarness(t, defaultScripts(), chain(serverVAD(true, true), func(o *Options) { o.Limits.InputAudioBufferMaxMs = 1000 }))
+	h.silence(2500)
+	h.speak(300)
+	h.silence(600)
+
+	started, _ := h.waitFor("speech_started", func(e Event) bool { _, ok := e.(EvSpeechStarted); return ok })
+	if st := started.(EvSpeechStarted); st.AudioStartMs != 2400 {
+		// speech at 2500 ms rolled back by 100 ms prefix padding
+		t.Fatalf("speech_started = %+v", st)
+	}
+	stopped, _ := h.waitFor("speech_stopped", func(e Event) bool { _, ok := e.(EvSpeechStopped); return ok })
+	if sp := stopped.(EvSpeechStopped); sp.AudioEndMs != 3000 {
+		t.Fatalf("speech_stopped = %+v", sp)
+	}
+	if done := h.waitResponseDone(0); done.Status != ResponseCompleted {
+		t.Fatalf("status = %s (%v)", done.Status, done.Err)
+	}
+	added, _ := first[EvItemAdded](h.all())
+	if added.Item.AudioMs != 600 {
+		t.Fatalf("committed audio = %d ms, want 600", added.Item.AudioMs)
+	}
+	for _, ev := range h.all() {
+		if er, ok := ev.(EvError); ok {
+			t.Fatalf("unexpected error: %+v", er)
+		}
+	}
+}
+
+func TestLongSilenceSemanticVADDoesNotOverflow(t *testing.T) {
+	h := newHarness(t, defaultScripts(), func(o *Options) {
+		e := "high"
+		o.Session.Audio.Input.TurnDetection = &config.TurnDetection{Type: config.TurnDetectionSemanticVAD, Eagerness: &e, CreateResponse: true, InterruptResponse: true}
+		o.Limits.InputAudioBufferMaxMs = 1000
+	})
+	h.silence(2500)
+	h.speak(300)
+	started, _ := h.waitFor("speech_started", func(e Event) bool { _, ok := e.(EvSpeechStarted); return ok })
+	if st := started.(EvSpeechStarted); st.AudioStartMs != 2500-config.DefaultVADPrefixPaddingMs {
+		t.Fatalf("speech_started = %+v", st)
+	}
+	for _, ev := range h.all() {
+		if er, ok := ev.(EvError); ok {
+			t.Fatalf("unexpected error: %+v", er)
+		}
+	}
+}
+
+func semanticVAD(o *Options) {
+	e := "high"
+	o.Session.Audio.Input.TurnDetection = &config.TurnDetection{Type: config.TurnDetectionSemanticVAD, Eagerness: &e, CreateResponse: true, InterruptResponse: true}
+	// End-of-turn wait with no Final = max(100 ms, eagerness high 400 ms).
+	o.Limits.ASRFinalTimeout = config.Duration(100 * time.Millisecond)
+}
+
+func noResponseNoError(t *testing.T, h *harness) {
+	t.Helper()
+	for _, ev := range h.all() {
+		switch e := ev.(type) {
+		case EvError:
+			t.Fatalf("unexpected error %+v; events: %s", e, describe(h.all()))
+		case EvResponseCreated, EvResponseDone:
+			t.Fatalf("unexpected response event; events: %s", describe(h.all()))
+		}
+	}
+}
+
+// holdSilence streams ms of silence at about 2x realtime and stops quietly
+// if the session dies; callers check for the fatal error.
+func holdSilence(h *harness, ms int) {
+	frame := make([]byte, audio.MsToBytes(20))
+	for range ms / 20 {
+		if err := h.s.PostAudio(frame); err != nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestSemanticVADNoiseOnlyTurnCreatesNoResponse covers a VAD segment whose
+// transcript is empty (a noise burst). The turn still ends — the recognizer
+// sends no Final before commit, so only the end-of-turn wait can end it —
+// the item is committed with an empty transcript, no response is created,
+// the buffer is released so a caller on hold does not overflow, and the next
+// real turn is answered.
+func TestSemanticVADNoiseOnlyTurnCreatesNoResponse(t *testing.T) {
+	sc := defaultScripts()
+	sc.asr.Utterances = []string{"", "what time is it?"}
+	h := newHarness(t, sc, chain(semanticVAD, func(o *Options) { o.Limits.InputAudioBufferMaxMs = 3000 }))
+	h.silence(100)
+	h.speak(300)
+	h.silence(500)
+	h.waitFor("item done", func(e Event) bool { _, ok := e.(EvItemDone); return ok })
+	// A caller on hold: 6.4 s of silence, twice the cap.
+	holdSilence(h, 6400)
+	want := []string{"SpeechStarted", "SpeechStopped", "Committed", "ItemAdded", "InputTranscriptDone", "ItemDone"}
+	var got []string
+	for _, ev := range h.all() {
+		got = append(got, typeName(ev))
+	}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("events = %v, want %v", got, want)
+	}
+	if td, _ := first[EvInputTranscriptDone](h.all()); td.Text != "" {
+		t.Fatalf("transcript = %q", td.Text)
+	}
+	noResponseNoError(t, h)
+	if n := h.s.conv.count(); n != 1 { // read after the actor went idle
+		t.Fatalf("conversation items = %d", n)
+	}
+
+	h.speak(300)
+	h.silence(500)
+	if d := h.waitResponseDone(0); d.Status != ResponseCompleted {
+		t.Fatalf("done = %+v", d)
+	}
+	if msgs := h.llm.Requests()[0].Messages; len(msgs) != 1 || msgs[0].Content != "what time is it?" {
+		t.Fatalf("request = %+v", msgs)
+	}
+}
+
+func TestSemanticVADNoFinalAtAllCreatesNoResponse(t *testing.T) {
+	sc := defaultScripts()
+	sc.asr.FinalDelay = mock.Duration(5 * time.Second)
+	h := newHarness(t, sc, chain(semanticVAD, func(o *Options) { o.Limits.InputAudioBufferMaxMs = 3000 }))
+	h.silence(100)
+	h.speak(300)
+	h.silence(500)
+	h.waitFor("committed", func(e Event) bool { _, ok := e.(EvAudioBufferCommitted); return ok })
+	holdSilence(h, 6400) // well past asr_final_timeout, and twice the cap
+	for _, ev := range h.all() {
+		if er, ok := ev.(EvError); ok && er.Fatal {
+			t.Fatalf("fatal error: %+v", er)
+		}
+	}
+	noResponseNoError(t, h)
+}
+
+func TestSemanticVADLateFinalCreatesResponse(t *testing.T) {
+	sc := defaultScripts()
+	sc.asr.Utterances = []string{"what time is it?"}
+	h := newHarness(t, sc, semanticVAD)
+	h.speak(300)
+	h.silence(500)
+	if d := h.waitResponseDone(0); d.Status != ResponseCompleted {
+		t.Fatalf("done = %+v", d)
+	}
+	_, done := first[EvInputTranscriptDone](h.all())
+	_, created := first[EvResponseCreated](h.all())
+	if done < 0 || created < done {
+		t.Fatalf("response.created must follow the transcript; events: %s", describe(h.all()))
+	}
+	if h.llm.Requests()[0].Messages[0].Content != "what time is it?" {
+		t.Fatalf("request = %+v", h.llm.Requests()[0].Messages)
+	}
+}
+
+func TestSemanticVADFinalTimeoutUsesPartial(t *testing.T) {
+	sc := defaultScripts()
+	sc.asr.PartialAfterMs = 100
+	sc.asr.FinalDelay = mock.Duration(2 * time.Second)
+	h := newHarness(t, sc, semanticVAD)
+	h.speak(300)
+	h.silence(500)
+	if d := h.waitResponseDone(0); d.Status != ResponseCompleted {
+		t.Fatalf("done = %+v", d)
+	}
+	if got := h.llm.Requests()[0].Messages[0].Content; got != "hello" { // first half of "hello there"
+		t.Fatalf("partial not used: %q", got)
+	}
+}
+
+func TestSemanticVADSpeechResumingDropsDeferredResponse(t *testing.T) {
+	sc := defaultScripts()
+	sc.asr.FinalDelay = mock.Duration(300 * time.Millisecond)
+	h := newHarness(t, sc, chain(semanticVAD, func(o *Options) { o.Limits.ASRFinalTimeout = config.Duration(time.Second) }))
+	h.speak(300)
+	h.silence(500)
+	h.waitFor("committed", func(e Event) bool { _, ok := e.(EvAudioBufferCommitted); return ok })
+	h.speak(300) // resumes before the first item's Final (300 ms away)
+	h.silence(500)
+	if d := h.waitResponseDone(0); d.Status != ResponseCompleted {
+		t.Fatalf("done = %+v", d)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := count[EvResponseCreated](h.all()); n != 1 {
+		t.Fatalf("responses = %d; events: %s", n, describe(h.all()))
+	}
+	if n := count[EvAudioBufferCommitted](h.all()); n != 2 {
+		t.Fatalf("commits = %d; events: %s", n, describe(h.all()))
+	}
+}
+
+func TestServerVADEmptyTranscriptStillResponds(t *testing.T) {
+	sc := defaultScripts()
+	sc.asr.Utterances = nil
+	h := newHarness(t, sc, serverVAD(true, true))
+	h.speak(300)
+	h.silence(600)
+	h.waitResponseDone(0)
+	if td, _ := first[EvInputTranscriptDone](h.all()); td.Text != "" {
+		t.Fatalf("transcript = %q", td.Text)
+	}
+	if count[EvResponseCreated](h.all()) != 1 {
+		t.Fatalf("events: %s", describe(h.all()))
+	}
+}
+
+func TestOverlongSpeechServerVADStillOverflows(t *testing.T) {
+	h := newHarness(t, defaultScripts(), chain(serverVAD(true, true), func(o *Options) { o.Limits.InputAudioBufferMaxMs = 1000 }))
+	h.silence(500)
+	h.speak(1500)
+	ev, _ := h.waitFor("fatal error", func(e Event) bool { er, ok := e.(EvError); return ok && er.Fatal })
+	if ev.(EvError).Code != ErrCodeBufferOverflow {
+		t.Fatalf("code = %s", ev.(EvError).Code)
+	}
+}
+
+func TestLongSilenceManualStillOverflows(t *testing.T) {
+	h := newHarness(t, defaultScripts(), chain(manual, func(o *Options) { o.Limits.InputAudioBufferMaxMs = 1000 }))
+	h.silence(1500)
+	ev, _ := h.waitFor("fatal error", func(e Event) bool { er, ok := e.(EvError); return ok && er.Fatal })
+	if ev.(EvError).Code != ErrCodeBufferOverflow {
+		t.Fatalf("code = %s", ev.(EvError).Code)
+	}
+}
+
 func TestInputQueueOverflowClosesSession(t *testing.T) {
 	// Fill the outbound queue so the actor blocks in emit, then overflow the
 	// bounded audio queue from the "read loop".
@@ -552,8 +781,9 @@ func TestSemanticVADEndOfTurnThroughSession(t *testing.T) {
 	if count[EvAudioBufferCommitted](h.all()) != 0 {
 		t.Fatal("semantic_vad must not commit on VAD end alone")
 	}
-	// No Final arrives without Finalize, so the eagerness timer must not be
-	// armed yet either; a client commit resolves the turn.
+	// No Final arrives without Finalize; the end-of-turn wait (max of
+	// asr_final_timeout and eagerness, 1 s here) has not fired yet, and a
+	// client commit resolves the turn first.
 	h.post(CmdCommitAudio{})
 	h.post(CmdCreateResponse{})
 	if d := h.waitResponseDone(0); d.Status != ResponseCompleted {

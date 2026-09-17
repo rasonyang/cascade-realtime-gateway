@@ -153,7 +153,7 @@ function_call_output  {id, object:"realtime.item", type:"function_call_output",
 | `conversation.item.input_audio_transcription.completed` | transcription enabled; `transcript`, `usage: {type:"duration", seconds}` |
 | `conversation.item.deleted` | after delete |
 | `conversation.item.truncated` | after truncate |
-| `response.created` | immediately on trigger (client or VAD), before the LLM starts |
+| `response.created` | immediately on trigger (client or `server_vad`), before the LLM starts; under `semantic_vad` after the committed item's transcript is final, and not at all when it is empty (§7) |
 | `response.output_item.added` | when the pipeline starts (after the user item's transcript is final) |
 | `response.content_part.added` | right after `response.output_item.added`; `part: {type:"audio", transcript:""}` or `{type:"text", text:""}` |
 | `response.output_audio_transcript.delta` / `.done` | audio responses |
@@ -222,6 +222,15 @@ input_audio_buffer.speech_started → input_audio_buffer.speech_stopped
 → response.output_item.added → … (audio response as above)
 ```
 With `create_response: false` the sequence stops after `conversation.item.done`; `input_audio_buffer.committed` is still emitted.
+
+**semantic_vad turn** (`create_response: true`, transcription enabled; a Cascade profile decision)
+```
+input_audio_buffer.speech_started → input_audio_buffer.speech_stopped
+→ input_audio_buffer.committed → conversation.item.added
+→ conversation.item.input_audio_transcription.delta × n → conversation.item.input_audio_transcription.completed → conversation.item.done
+→ response.created → response.output_item.added → … (audio response as above)
+```
+`response.created` follows the transcript rather than the commit (the LLM starts at the same moment as under `server_vad`). When the transcript is empty or whitespace (non-speech noise) the sequence stops after `conversation.item.done`: no response is created and no error is sent. If no Final arrives within `asr_final_timeout`, a Partial starts the response; without one there is no response and no error. The end of turn waits at most max(`asr_final_timeout`, eagerness delay) after `speech_stopped` for a Final to judge. A `speech_started` during an active response still interrupts it per `interrupt_response`, even if that speech turns out to be noise.
 
 **Interruption** (`interrupt_response: true`, response in progress)
 ```

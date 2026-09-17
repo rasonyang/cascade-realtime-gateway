@@ -346,6 +346,33 @@ func TestFatalErrorClosesWith1011(t *testing.T) {
 	}
 }
 
+// A caller on hold streams silence past input_audio_buffer_max_ms under
+// server_vad; the connection must stay up.
+func TestLongSilenceServerVADStaysConnected(t *testing.T) {
+	f := newFixture(t, defaultLLM(), func(c *config.Config, _ *config.Profile) {
+		c.Limits.InputAudioBufferMaxMs = 1000
+	})
+	c := f.connect()
+	c.readUntil("conversation.created")
+	frame := base64.StdEncoding.EncodeToString(make([]byte, audio.MsToBytes(100)))
+	for range 30 {
+		c.send(fmt.Sprintf(`{"type":"input_audio_buffer.append","audio":%q}`, frame))
+	}
+	c.send(`{"type":"input_audio_buffer.clear"}`)
+	for {
+		ev, err := c.read()
+		if err != nil {
+			t.Fatalf("connection ended during silence: %v", err)
+		}
+		if ev["type"] == "error" {
+			t.Fatalf("error during silence: %v", ev)
+		}
+		if ev["type"] == "input_audio_buffer.cleared" {
+			return
+		}
+	}
+}
+
 func TestReadLimitCloses(t *testing.T) {
 	f := newFixture(t, defaultLLM(), func(c *config.Config, _ *config.Profile) { c.Limits.ClientMaxMessageBytes = 256 })
 	c := f.connect()

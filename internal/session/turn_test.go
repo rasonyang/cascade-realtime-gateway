@@ -110,38 +110,84 @@ func TestSemanticVADDefersUntilEndOfTurn(t *testing.T) {
 		// Provider EndOfTurn ends the turn.
 		runSteps(t, tm, []step{
 			{vadSpeechStart{}, TurnDecision{EmitSpeechStarted: true}},
-			{vadSpeechEnd{}, TurnDecision{EmitSpeechStopped: true}},
-			{asrEndOfTurn{}, TurnDecision{Commit: true, Trigger: create}},
+			{vadSpeechEnd{}, TurnDecision{EmitSpeechStopped: true, ArmFinalWaitTimer: true}},
+			{asrEndOfTurn{}, TurnDecision{Commit: true, DeferTrigger: create}},
 			{asrEndOfTurn{}, TurnDecision{}}, // duplicate is ignored
 		})
 		// Final with terminal punctuation after speech end ends the turn now.
 		runSteps(t, tm, []step{
 			{vadSpeechStart{}, TurnDecision{EmitSpeechStarted: true}},
-			{vadSpeechEnd{}, TurnDecision{EmitSpeechStopped: true}},
-			{asrFinal{"How are you?"}, TurnDecision{Commit: true, Trigger: create}},
+			{vadSpeechEnd{}, TurnDecision{EmitSpeechStopped: true, ArmFinalWaitTimer: true}},
+			{asrFinal{"How are you?"}, TurnDecision{Commit: true, DeferTrigger: create}},
 		})
 		// Final without punctuation arms the eagerness timer; timer → end of turn.
 		runSteps(t, tm, []step{
 			{vadSpeechStart{}, TurnDecision{EmitSpeechStarted: true}},
-			{vadSpeechEnd{}, TurnDecision{EmitSpeechStopped: true}},
+			{vadSpeechEnd{}, TurnDecision{EmitSpeechStopped: true, ArmFinalWaitTimer: true}},
 			{asrFinal{"so I was thinking"}, TurnDecision{ArmEndOfTurnTimer: true}},
-			{asrEndOfTurn{}, TurnDecision{Commit: true, Trigger: create}},
+			{asrEndOfTurn{}, TurnDecision{Commit: true, DeferTrigger: create}},
 		})
 		// Final arriving before speech end is remembered.
 		runSteps(t, tm, []step{
 			{vadSpeechStart{}, TurnDecision{EmitSpeechStarted: true}},
 			{asrFinal{"Done."}, TurnDecision{}},
-			{vadSpeechEnd{}, TurnDecision{EmitSpeechStopped: true, Commit: true, Trigger: create}},
+			{vadSpeechEnd{}, TurnDecision{EmitSpeechStopped: true, Commit: true, DeferTrigger: create}},
 		})
 		// Speech resuming while waiting cancels the pending end of turn.
 		runSteps(t, tm, []step{
 			{vadSpeechStart{}, TurnDecision{EmitSpeechStarted: true}},
-			{vadSpeechEnd{}, TurnDecision{EmitSpeechStopped: true}},
+			{vadSpeechEnd{}, TurnDecision{EmitSpeechStopped: true, ArmFinalWaitTimer: true}},
 			{asrFinal{"and then"}, TurnDecision{ArmEndOfTurnTimer: true}},
 			{vadSpeechStart{}, TurnDecision{EmitSpeechStarted: true}},
 			{asrEndOfTurn{}, TurnDecision{}}, // stale timer firing is ignored
-			{vadSpeechEnd{}, TurnDecision{EmitSpeechStopped: true}},
-			{asrFinal{"and then some more。"}, TurnDecision{Commit: true, Trigger: create}},
+			{vadSpeechEnd{}, TurnDecision{EmitSpeechStopped: true, ArmFinalWaitTimer: true}},
+			{asrFinal{"and then some more。"}, TurnDecision{Commit: true, DeferTrigger: create}},
+		})
+	}
+}
+
+func TestSemanticVADSpeechEndWithoutFinalIsBounded(t *testing.T) {
+	for _, create := range []bool{true, false} {
+		tm := newTurnManager(td(config.TurnDetectionSemanticVAD, create, true))
+		// No Final ever arrives (a noise burst): the wait timer ends the turn.
+		runSteps(t, tm, []step{
+			{vadSpeechStart{}, TurnDecision{EmitSpeechStarted: true}},
+			{vadSpeechEnd{}, TurnDecision{EmitSpeechStopped: true, ArmFinalWaitTimer: true}},
+			{asrEndOfTurn{}, TurnDecision{Commit: true, DeferTrigger: create}},
+			{asrEndOfTurn{}, TurnDecision{}}, // nothing left pending
+		})
+		// A Final without punctuation inside the wait re-arms the eagerness timer.
+		runSteps(t, tm, []step{
+			{vadSpeechStart{}, TurnDecision{EmitSpeechStarted: true}},
+			{vadSpeechEnd{}, TurnDecision{EmitSpeechStopped: true, ArmFinalWaitTimer: true}},
+			{asrFinal{"well"}, TurnDecision{ArmEndOfTurnTimer: true}},
+			{asrEndOfTurn{}, TurnDecision{Commit: true, DeferTrigger: create}},
+		})
+		// An empty Final (what qwen sends for noise) is not terminal either.
+		runSteps(t, tm, []step{
+			{vadSpeechStart{}, TurnDecision{EmitSpeechStarted: true}},
+			{vadSpeechEnd{}, TurnDecision{EmitSpeechStopped: true, ArmFinalWaitTimer: true}},
+			{asrFinal{""}, TurnDecision{ArmEndOfTurnTimer: true}},
+		})
+		tm.Step(clientCommit{})
+		// A terminal Final inside the wait still ends the turn at once.
+		runSteps(t, tm, []step{
+			{vadSpeechStart{}, TurnDecision{EmitSpeechStarted: true}},
+			{vadSpeechEnd{}, TurnDecision{EmitSpeechStopped: true, ArmFinalWaitTimer: true}},
+			{asrFinal{"Yes."}, TurnDecision{Commit: true, DeferTrigger: create}},
+		})
+		// A Final already pending at speech end is judged; no wait is armed.
+		runSteps(t, tm, []step{
+			{vadSpeechStart{}, TurnDecision{EmitSpeechStarted: true}},
+			{asrFinal{"so"}, TurnDecision{}},
+			{vadSpeechEnd{}, TurnDecision{EmitSpeechStopped: true, ArmEndOfTurnTimer: true}},
+			{asrEndOfTurn{}, TurnDecision{Commit: true, DeferTrigger: create}},
+		})
+		// server_vad never arms either timer and triggers at once.
+		sv := newTurnManager(td(config.TurnDetectionServerVAD, create, true))
+		runSteps(t, sv, []step{
+			{vadSpeechStart{}, TurnDecision{EmitSpeechStarted: true}},
+			{vadSpeechEnd{}, TurnDecision{EmitSpeechStopped: true, Commit: true, Trigger: create}},
 		})
 	}
 }

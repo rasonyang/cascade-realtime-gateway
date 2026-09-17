@@ -41,14 +41,24 @@ func (responseEnded) isTurnInput()        {}
 
 // TurnDecision is what the actor must do next. ArmEndOfTurnTimer asks the
 // actor to start the semantic_vad eagerness timer, which feeds asrEndOfTurn
-// when it fires.
+// when it fires. ArmFinalWaitTimer asks for the bounded wait used when speech
+// ended with no Final to judge; it feeds asrEndOfTurn the same way, and a
+// Final arriving first replaces it through judge. The two are never set
+// together.
+//
+// DeferTrigger is semantic_vad's form of Trigger: the response is created
+// only once the committed item's transcript is known, and not at all when
+// that transcript is empty (non-speech noise). Trigger and DeferTrigger are
+// never set together.
 type TurnDecision struct {
 	EmitSpeechStarted bool
 	EmitSpeechStopped bool
 	Interrupt         bool
 	Commit            bool
 	Trigger           bool
+	DeferTrigger      bool
 	ArmEndOfTurnTimer bool
+	ArmFinalWaitTimer bool
 }
 
 // TurnManager is a pure state machine: no goroutines, no timers, no access
@@ -122,6 +132,11 @@ func (t *TurnManager) Step(in TurnInput) TurnDecision {
 			if t.finalPending {
 				t.finalPending = false
 				t.judge(t.finalTerminal, &d)
+			} else {
+				// Some recognizers emit no Final for a segment (a noise
+				// burst). Without a bound the turn would wait forever and
+				// the marked buffer segment would never be released.
+				d.ArmFinalWaitTimer = true
 			}
 		}
 	case asrFinal:
@@ -156,7 +171,11 @@ func (t *TurnManager) judge(terminal bool, d *TurnDecision) {
 
 func (t *TurnManager) endTurn(d *TurnDecision) {
 	d.Commit = true
-	d.Trigger = t.createResponse
+	if t.mode == modeSemanticVAD {
+		d.DeferTrigger = t.createResponse
+	} else {
+		d.Trigger = t.createResponse
+	}
 	t.resetTurn()
 }
 
