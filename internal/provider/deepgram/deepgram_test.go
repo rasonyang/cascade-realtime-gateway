@@ -35,11 +35,25 @@ type fakeDeepgram struct {
 	closedAt  time.Time
 	closeCode websocket.StatusCode
 	connected chan struct{}
+	// done is closed when the handler returns, i.e. once every frame the
+	// client sent has been recorded.
+	done chan struct{}
+}
+
+// waitDone blocks until the fake's handler has finished reading the stream.
+func (f *fakeDeepgram) waitDone(t *testing.T) {
+	t.Helper()
+	select {
+	case <-f.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for the fake server to finish the stream")
+	}
 }
 
 func newFake(t *testing.T) (*fakeDeepgram, *httptest.Server) {
-	f := &fakeDeepgram{t: t, connected: make(chan struct{})}
+	f := &fakeDeepgram{t: t, connected: make(chan struct{}), done: make(chan struct{})}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(f.done)
 		f.mu.Lock()
 		f.auth = r.Header.Get("Authorization")
 		f.query = map[string]string{}
@@ -203,6 +217,9 @@ func TestQueryAuthAndMapping(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// Close sends CloseStream; wait for the fake to have read it before
+	// asserting on the control frames it recorded.
+	f.waitDone(t)
 	f.mu.Lock()
 	ctl := f.control
 	f.mu.Unlock()

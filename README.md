@@ -9,8 +9,9 @@ REALTIME_API_KEY=... ADMIN_API_KEY=... DEEPGRAM_API_KEY=... OPENAI_API_KEY=... .
 ```
 
 Clients connect to `ws://<listen>/v1/realtime?model=<any>` with `Authorization: Bearer $REALTIME_API_KEY`
-and speak the OpenAI Realtime GA protocol (`session.type = "realtime"`). Cascade serves plain WebSocket;
-put a TLS terminator in front of it for `wss://` (the official OpenAI SDKs require `wss:`).
+and speak a documented subset of the OpenAI Realtime GA protocol (`session.type = "realtime"`). Cascade
+serves plain WebSocket; put a TLS terminator in front of it for `wss://` (the official OpenAI SDKs
+require `wss:`).
 
 ## Function calling
 
