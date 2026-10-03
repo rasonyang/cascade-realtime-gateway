@@ -359,8 +359,8 @@ Each real provider: parses only its own `json.RawMessage` inside its package; ti
   "auth": { "api_key": "{env.REALTIME_API_KEY}" },
   "providers": {
     "asr": { "type": "deepgram", "api_key": "{env.DEEPGRAM_API_KEY}", "options": { "model": "nova-3" } },
-    "llm": { "type": "openai",   "api_key": "{env.OPENAI_API_KEY}",   "options": { "model": "gpt-4o-mini", "base_url": "https://api.openai.com/v1" } },
-    "tts": { "type": "openai",   "api_key": "{env.OPENAI_API_KEY}",   "options": { "model": "tts-1" } }
+    "llm": { "type": "openai",   "api_key": "{env.OPENAI_API_KEY}",   "options": { "model": "gpt-6-luna", "base_url": "https://api.openai.com/v1" } },
+    "tts": { "type": "openai",   "api_key": "{env.OPENAI_API_KEY}",   "options": { "model": "gpt-realtime-2.1-mini" } }
   },
   "session_defaults": {
     "instructions": "You are a helpful assistant.",

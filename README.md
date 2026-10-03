@@ -156,7 +156,7 @@ parse failure.
 | Type | ASR | LLM | TTS | Notes |
 |---|:-:|:-:|:-:|---|
 | `deepgram` | ✓ | | | streaming ASR |
-| `openai` | | ✓ | ✓ | Chat Completions and `/audio/speech`; `base_url` is configurable |
+| `openai` | | ✓ | ✓ | Chat Completions; TTS over the Realtime API (default) or `/audio/speech`; `base_url` is configurable |
 | `qwen` | ✓ | ✓ | ✓ | Alibaba Cloud Model Studio (DashScope) |
 | `mock` | ✓ | ✓ | ✓ | deterministic and scriptable; no network, no keys |
 
@@ -168,7 +168,10 @@ interface and registering it.
 `options` per type:
 
 - `openai` LLM: `model`, `base_url`, `request_timeout`, `stream_idle_timeout`, `reasoning_effort` (sent
-  only when set; non-reasoning models reject the field). `openai` TTS: `model`, `base_url`, timeouts.
+  only when set, except that the default `gpt-6-luna` defaults it to `none`, which it needs to accept tools;
+  non-reasoning models reject the field). `openai` TTS: `model`, `base_url`, timeouts. A TTS model whose ID
+  contains `realtime` (default `gpt-realtime-2.1-mini`) uses a Realtime WebSocket, one per response; any other
+  (`tts-1`, `gpt-4o-mini-tts`, retired 2027-01-06) uses `/audio/speech`.
 - `deepgram`: `model`, `base_url`, `language`, `smart_format`, `endpointing_ms`, `utterance_end_ms`,
   `connect_timeout`, `finalize_timeout`, `keepalive_interval`, `audio_queue_frames`.
 - `qwen`: see [`internal/provider/qwen`](internal/provider/qwen) and

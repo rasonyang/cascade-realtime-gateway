@@ -23,7 +23,7 @@ type TTSOptions struct {
 }
 
 const (
-	defaultTTSModel = "tts-1"
+	defaultTTSModel = "gpt-realtime-2.1-mini"
 	// audioChunkMs is the read granularity of the streamed PCM body.
 	audioChunkMs = 100
 	audioQueue   = 32
@@ -41,8 +41,11 @@ func init() {
 	})
 }
 
-// TTS is the speech endpoint client. It has neither incremental text input
-// nor alignment: the pipeline issues one Synthesize per sentence.
+// TTS is the OpenAI speech client. A model whose ID contains "realtime" is
+// synthesized over a Realtime WebSocket (incremental text, one connection per
+// stream, see realtime_tts.go); any other model uses POST /audio/speech, which
+// has neither incremental text input nor alignment, so the pipeline issues one
+// Synthesize per sentence.
 type TTS struct {
 	apiKey string
 	opts   TTSOptions
@@ -62,7 +65,9 @@ func NewTTS(apiKey string, o TTSOptions) *TTS {
 func (t *TTS) Kind() provider.Kind { return provider.KindTTS }
 
 // Capabilities implements provider.TTS.
-func (t *TTS) Capabilities() provider.TTSCaps { return provider.TTSCaps{} }
+func (t *TTS) Capabilities() provider.TTSCaps {
+	return provider.TTSCaps{IncrementalText: isRealtimeModel(t.opts.Model)}
+}
 
 type speechRequest struct {
 	Model          string  `json:"model"`
@@ -74,6 +79,9 @@ type speechRequest struct {
 
 // Synthesize implements provider.TTS.
 func (t *TTS) Synthesize(ctx context.Context, cfg provider.TTSConfig) (provider.TTSStream, error) {
+	if isRealtimeModel(t.opts.Model) {
+		return t.synthesizeRealtime(ctx, cfg)
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	return &ttsStream{tts: t, cfg: cfg, ctx: ctx, cancel: cancel, chunks: make(chan provider.AudioChunk, audioQueue), errc: make(chan error, 1)}, nil
 }

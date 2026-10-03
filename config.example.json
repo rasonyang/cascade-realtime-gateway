@@ -38,7 +38,7 @@
         "type": "openai",
         "api_key": "{env.OPENAI_API_KEY}",
         "options": {
-          "model": "gpt-4o-mini",
+          "model": "gpt-6-luna",
           "base_url": "https://api.openai.com/v1"
         }
       },
@@ -47,7 +47,7 @@
         "type": "openai",
         "api_key": "{env.OPENAI_API_KEY}",
         "options": {
-          "model": "tts-1"
+          "model": "gpt-realtime-2.1-mini"
         }
       }
     },
