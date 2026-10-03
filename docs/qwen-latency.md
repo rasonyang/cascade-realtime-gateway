@@ -1,15 +1,22 @@
 # Qwen provider latency
 
-Measured 2026-09-01 against a live Alibaba Cloud Model Studio endpoint from a
-machine in China, with `hack/qwenbench`. Models:
-`qwen-audio-3.0-asr-flash-streaming`, `qwen3.6-flash`,
-`qwen-audio-3.0-tts-flash` (voice `longanlingxi`).
+Two measurement sets, both from a machine in China with `hack/qwenbench`:
 
-The numbers below came from a dedicated Model Studio deployment, whose host is
-account-specific; the package default is the public endpoint
-(`dashscope.aliyuncs.com`). Latency on the public endpoint has not been
-measured and will differ. Point a provider at a dedicated deployment with
-`options.base_url` (LLM) and `options.url` (ASR, TTS).
+- **2026-09-01**, dedicated Model Studio deployment, the 3.0 audio models:
+  `qwen-audio-3.0-asr-flash-streaming`, `qwen3.6-flash`,
+  `qwen-audio-3.0-tts-flash` (voice `longanlingxi`). Everything down to
+  [the 2026-10-03 section](#2026-10-03-public-endpoint-30-baseline-and-31-upgrade)
+  is this set.
+- **2026-10-03**, public endpoint, the package defaults now in the code:
+  `qwen-audio-3.1-asr-flash-streaming`, `qwen3.6-flash`,
+  `qwen-audio-3.1-tts-flash` (voice `longanlingxi_v3.1`), compared with a 3.0
+  baseline taken the same day.
+
+The 2026-09-01 numbers came from a dedicated Model Studio deployment, whose
+host is account-specific; the package default is the public endpoint
+(`dashscope.aliyuncs.com`), which the 2026-10-03 section measures. Point a
+provider at a dedicated deployment with `options.base_url` (LLM) and
+`options.url` (ASR, TTS).
 
 Reproduce with:
 
@@ -224,3 +231,72 @@ audio 5.9 s after commit. The Qwen set reaches it in 831 ms at the median.
 The bulk of that gap is the network path: the Beijing endpoint answers in
 tens of milliseconds from this machine, where the previous stack was paying
 0.6–1.1 s TLS handshakes per provider.
+
+## 2026-10-03: public endpoint, 3.0 baseline and 3.1 upgrade
+
+Public endpoint (`dashscope.aliyuncs.com`, `QWEN_HOST` unset), 20 warm samples
+per provider and 20 turns, same flags as above. The fixture utterance is
+re-synthesized by whichever TTS model is under test, so it differs slightly
+between runs (2360 ms for 3.0, 2240 ms for 3.1).
+
+```sh
+ALIYUN_API_KEY=… go run ./hack/qwenbench -label baseline-3.0-public -samples 20 -turns 20   # on the commit before the upgrade
+ALIYUN_API_KEY=… go run ./hack/qwenbench -label after-3.1-public    -samples 20 -turns 20   # on the upgrade
+```
+
+Acceptance metric, end of user speech → first playable audio:
+
+| | p50 | p90 | p95 |
+| --- | ---: | ---: | ---: |
+| 2026-09-01, dedicated deployment, 3.0 | 1223 | 1613 | 1854 |
+| 2026-10-03, public endpoint, 3.0 baseline | 1153 | 1347 | 1542 |
+| 2026-10-03, public endpoint, 3.1 (ASR + TTS) | **1063** | **1272** | **1283** |
+
+Per-stage medians (ms), 3.0 baseline against 3.1:
+
+| stage | 3.0 | 3.1 |
+| --- | ---: | ---: |
+| speech end → commit (VAD hold) | 378.5 | 274.0 |
+| speech end → ASR final | 572.3 | 546.7 |
+| speech end → LLM first token | 804.1 | 756.7 |
+| first TTS text → provider audio | 252.6 | 219.7 |
+| commit → first playable audio | 773.5 | 789.9 |
+| standalone ASR Finalize → final | 179.1 | 328.7 |
+| standalone TTS first text → audio (incremental) | 297.8 | 257.8 |
+| standalone LLM request → first token (`qwen3.6-flash`) | 224.9 | 181.2 |
+
+Reading the difference:
+
+- **The headline is better by 90 ms, but not all of it is real.** The VAD hold
+  shrank by ~100 ms because the 3.1 fixture is synthesized with a different
+  tail, so the same "speech end" anchor sits nearer to where the acoustic VAD
+  sees silence. The like-for-like figure, commit → first playable audio
+  (the hold removed), is 774 ms for 3.0 and 790 ms for 3.1: equal within
+  run-to-run noise. The upgrade is therefore a latency no-op on the public
+  endpoint, not a regression and not a gain.
+- **ASR Finalize → final is slower on 3.1** (329 ms against 179 ms standalone;
+  a second probe with another fixture measured 213 against 177 ms, so the shift
+  is real but its size is uncertain). In the gateway turn, commit → ASR final
+  rose from ~194 ms to ~273 ms (speech end → final minus the VAD hold); the
+  faster TTS and LLM first token absorb most of it, leaving commit → first
+  playable audio 16 ms slower.
+- **TTS first audio is ~40 ms faster** on 3.1 (incremental 258 against 298 ms).
+- Natural-VAD finals (no `Finalize`) are ~1305 ms on 3.1 against ~1252 ms on
+  3.0 after speech end, not material. `vad_model=near_meeting_16k` on the 3.1
+  ASR would cut that to ~960 ms but is not adopted
+  (see `docs/decisions.md`, 2026-10-03).
+- The flush nudge is still needed on 3.1: with an 800 ms gap, first audio is
+  1025 ms without it and 222 ms with it.
+
+### Why the LLM stays on `qwen3.6-flash`
+
+`qwen3.8-flash` was measured on the same endpoint. It is functionally
+compatible (`enable_thinking: false` still required, tool calls unchanged) but
+slower to first token: TTFT p50 655 and 638 ms in two interleaved runs against
+171 and 181 ms for `qwen3.6-flash` (p90 1106–1223 ms, max 3.5 s and 5.8 s).
+The full 3.1 + 3.8 gateway turn measured **p50 1601 / p90 1840 / p95 2393 ms**,
+with speech end → LLM first token moving from 804 ms to 1186 ms at the median.
+That is ~540 ms worse than the 3.1 + 3.6 default, so 3.6 stays; 3.8 can be
+selected per instance with `options.model`. `qwen3.6-flash` is no longer on
+the Model Studio models page though it is still served, so this choice should
+be revisited.

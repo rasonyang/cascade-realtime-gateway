@@ -77,7 +77,7 @@ func TestTTSLifecycleAndTaskID(t *testing.T) {
 	f, srv := newFakeWS(t)
 	defer srv.Close()
 	f.onFrame = ttsScript(f, 100)
-	s := openTTS(t, f, wsURL(srv), provider.TTSConfig{Voice: "longanlingxi", Speed: 1, SampleRate: audio.SampleRate})
+	s := openTTS(t, f, wsURL(srv), provider.TTSConfig{Voice: "longanlingxi_v3.1", Speed: 1, SampleRate: audio.SampleRate})
 
 	for _, sentence := range []string{"The ocean is vast. ", "It covers most of the planet."} {
 		if err := s.WriteText(sentence); err != nil {
@@ -182,7 +182,7 @@ func TestTTSRunTaskShape(t *testing.T) {
 	f, srv := newFakeWS(t)
 	defer srv.Close()
 	f.onFrame = ttsScript(f, 20)
-	s := openTTS(t, f, wsURL(srv), provider.TTSConfig{Voice: "longanlingxi", Speed: 1.2})
+	s := openTTS(t, f, wsURL(srv), provider.TTSConfig{Voice: "longanlingxi_v3.1", Speed: 1.2})
 	s.WriteText("hello")
 	s.EndInput()
 	drainTTS(t, s)
@@ -199,7 +199,7 @@ func TestTTSRunTaskShape(t *testing.T) {
 	if got := run.Params["sample_rate"]; got != float64(audio.SampleRate) {
 		t.Errorf("sample_rate = %v, want %d", got, audio.SampleRate)
 	}
-	if got := run.Params["voice"]; got != "longanlingxi" {
+	if got := run.Params["voice"]; got != "longanlingxi_v3.1" {
 		t.Errorf("voice = %v, want the session voice", got)
 	}
 	if got := run.Params["rate"]; got != 1.2 {

@@ -94,7 +94,7 @@ func TestE2EQwenAdminProfile(t *testing.T) {
 	// keeps one utterance in one turn.
 	profileBody := `{"name":"voice","asr":"qwen-asr","llm":"qwen-llm","tts":"qwen-tts",
 	  "instructions":"You are a concise voice assistant. Answer in one short sentence.",
-	  "voice":"longanlingxi",
+	  "voice":"longanlingxi_v3.1",
 	  "asr_language":"en",
 	  "turn_detection":{"type":"server_vad","silence_duration_ms":800}}`
 	if code, b := admWrite("PUT", "/profiles/voice", profileBody); code != http.StatusOK {
@@ -122,7 +122,7 @@ func TestE2EQwenAdminProfile(t *testing.T) {
 	c := f.connect()
 	c.timeout = 40 * time.Second
 	sess := c.readUntil("session.created")
-	if got := qwenVoice(t, sess); got != "longanlingxi" {
+	if got := qwenVoice(t, sess); got != "longanlingxi_v3.1" {
 		t.Fatalf("session voice = %q, want the profile's", got)
 	}
 	c.readUntil("conversation.created")
@@ -218,16 +218,16 @@ turnDone:
 	capture.dump(t, "qwen chat stream closed")
 
 	// ---- 5. An Admin write is invisible to the live session -----------------
-	if code, b := admWrite("PUT", "/profiles/voice", strings.Replace(profileBody, `"voice":"longanlingxi"`, `"voice":"longwan"`, 1)); code != http.StatusOK {
+	if code, b := admWrite("PUT", "/profiles/voice", strings.Replace(profileBody, `"voice":"longanlingxi_v3.1"`, `"voice":"longanhuan_v3.1"`, 1)); code != http.StatusOK {
 		t.Fatalf("PUT profile = %d %s", code, b)
 	}
 	c.send(`{"type":"session.update","session":{"type":"realtime"}}`)
-	if got := qwenVoice(t, c.readUntil("session.updated")); got != "longanlingxi" {
+	if got := qwenVoice(t, c.readUntil("session.updated")); got != "longanlingxi_v3.1" {
 		t.Fatalf("live session voice changed to %q", got)
 	}
 	fresh := f.connect()
 	fresh.timeout = 20 * time.Second
-	if got := qwenVoice(t, fresh.readUntil("session.created")); got != "longwan" {
+	if got := qwenVoice(t, fresh.readUntil("session.created")); got != "longanhuan_v3.1" {
 		t.Fatalf("new session voice = %q, want the updated profile", got)
 	}
 	t.Log("STEP 5  live session kept its snapshot; the next connection picked up the Admin write")
@@ -241,7 +241,7 @@ turnDone:
 	if err != nil {
 		t.Fatalf("resolve after restart: %v", err)
 	}
-	if rt.Profile != "voice" || rt.Session.Audio.Output.Voice != "longwan" || rt.ASRName != "qwen-asr" {
+	if rt.Profile != "voice" || rt.Session.Audio.Output.Voice != "longanhuan_v3.1" || rt.ASRName != "qwen-asr" {
 		t.Fatalf("resolved runtime after restart: %+v", rt)
 	}
 	if rt.Temperature != nil {
@@ -297,7 +297,7 @@ func TestE2EQwenToolCall(t *testing.T) {
 	}
 	if code, b := admWrite("PUT", "/profiles/voice", `{"name":"voice","asr":"qwen-asr","llm":"qwen-llm","tts":"qwen-tts",
 	  "instructions":"You are a call-centre agent. Use the tools you are given rather than answering in prose.",
-	  "voice":"longanlingxi","asr_language":"en","turn_detection":null}`); code != http.StatusOK {
+	  "voice":"longanlingxi_v3.1","asr_language":"en","turn_detection":null}`); code != http.StatusOK {
 		t.Fatalf("PUT profile = %d %s", code, b)
 	}
 	if code, b := admWrite("PUT", "/settings", `{"default_profile":"voice"}`); code != http.StatusOK {

@@ -29,7 +29,7 @@
         "type": "qwen",
         "api_key": "{env.ALIYUN_API_KEY}",
         "options": {
-          "model": "qwen-audio-3.0-asr-flash-streaming"
+          "model": "qwen-audio-3.1-asr-flash-streaming"
         }
       },
       "qwen-llm": {
@@ -45,7 +45,7 @@
         "type": "qwen",
         "api_key": "{env.ALIYUN_API_KEY}",
         "options": {
-          "model": "qwen-audio-3.0-tts-flash"
+          "model": "qwen-audio-3.1-tts-flash"
         }
       }
     },
@@ -60,7 +60,7 @@
         "output_modalities": [
           "audio"
         ],
-        "voice": "longanlingxi",
+        "voice": "longanlingxi_v3.1",
         "speed": 1.0,
         "asr_language": "zh",
         "asr_model": "",

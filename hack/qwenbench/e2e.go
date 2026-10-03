@@ -46,7 +46,7 @@ func benchE2E(ctx context.Context, key string, pcm []byte, turns int, ttsOpts qw
 	prof := config.DefaultProfile()
 	prof.Name, prof.ASR, prof.LLM, prof.TTS = "bench", "qwen-asr", "qwen-llm", "qwen-tts"
 	prof.Instructions = "You are a concise voice assistant. Answer in two short sentences."
-	prof.Voice = "longanlingxi"
+	prof.Voice = "longanlingxi_v3.1"
 	prof.TurnDetection.ApplyDefaults()
 
 	rt := admin.Runtime{
