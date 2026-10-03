@@ -97,13 +97,39 @@ func TestLLMOmitsReasoningEffortByDefault(t *testing.T) {
 		sse(w, `[DONE]`)
 	}))
 	defer srv.Close()
-	ch, _ := NewLLM("k", LLMOptions{httpOptions: opts(srv.URL)}).Chat(context.Background(), provider.ChatRequest{})
+	ch, _ := NewLLM("k", LLMOptions{httpOptions: opts(srv.URL), Model: "gpt-test"}).Chat(context.Background(), provider.ChatRequest{})
 	drain(t, ch)
 	if _, present := raw["reasoning_effort"]; present {
 		t.Fatal("reasoning_effort must be omitted when not configured")
 	}
 	if _, present := raw["max_completion_tokens"]; present {
 		t.Fatal("max_completion_tokens must be omitted when unlimited")
+	}
+}
+
+// TestLLMReasoningEffortDefault: the default model rejects tools unless
+// reasoning_effort is "none", so it defaults to that; other models keep the
+// field omitted, and an explicit value always wins.
+func TestLLMReasoningEffortDefault(t *testing.T) {
+	for _, tc := range []struct {
+		name, model, effort, want string
+	}{
+		{"default model", "", "", "none"},
+		{"explicit default model", defaultChatModel, "", "none"},
+		{"other model", "gpt-test", "", ""},
+		{"explicit effort wins", "", "low", "low"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var raw map[string]any
+			srv := chatServer(t, nil, &raw, `[DONE]`)
+			ch, _ := NewLLM("k", LLMOptions{httpOptions: opts(srv.URL), Model: tc.model, ReasoningEffort: tc.effort}).
+				Chat(context.Background(), provider.ChatRequest{})
+			drain(t, ch)
+			got, _ := raw["reasoning_effort"].(string)
+			if got != tc.want {
+				t.Fatalf("reasoning_effort = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -239,7 +265,7 @@ func TestTTSStreamsPCM(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
-	tts := NewTTS("k", TTSOptions{httpOptions: opts(srv.URL + "/v1")})
+	tts := NewTTS("k", TTSOptions{httpOptions: opts(srv.URL + "/v1"), Model: "tts-1"})
 	if caps := tts.Capabilities(); caps.IncrementalText || caps.Alignment {
 		t.Fatal("openai tts must report no optional capabilities")
 	}
@@ -254,7 +280,7 @@ func TestTTSStreamsPCM(t *testing.T) {
 	if len(out) != audio.MsToBytes(250) || out[5] != 5 || out[len(out)-1] != pcm[len(pcm)-2] {
 		t.Fatalf("pcm len=%d", len(out))
 	}
-	if got.Input != "Hello world." || got.Voice != "coral" || got.ResponseFormat != "pcm" || got.Speed != 1.2 || got.Model != defaultTTSModel {
+	if got.Input != "Hello world." || got.Voice != "coral" || got.ResponseFormat != "pcm" || got.Speed != 1.2 || got.Model != "tts-1" {
 		t.Fatalf("request = %+v", got)
 	}
 	if _, err := readAll(t, s); !errors.Is(err, nil) {
@@ -271,7 +297,7 @@ func TestTTSErrorAndCancel(t *testing.T) {
 		w.WriteHeader(429)
 		io.WriteString(w, "slow down")
 	}))
-	tts := NewTTS("k", TTSOptions{httpOptions: opts(srv.URL)})
+	tts := NewTTS("k", TTSOptions{httpOptions: opts(srv.URL), Model: "tts-1"})
 	s, _ := tts.Synthesize(context.Background(), provider.TTSConfig{})
 	s.WriteText("x")
 	s.EndInput()
@@ -294,7 +320,7 @@ func TestTTSErrorAndCancel(t *testing.T) {
 	}))
 	defer slow.Close()
 	ctx, cancel := context.WithCancel(context.Background())
-	s2, _ := NewTTS("k", TTSOptions{httpOptions: opts(slow.URL)}).Synthesize(ctx, provider.TTSConfig{})
+	s2, _ := NewTTS("k", TTSOptions{httpOptions: opts(slow.URL), Model: "tts-1"}).Synthesize(ctx, provider.TTSConfig{})
 	s2.WriteText("x")
 	s2.EndInput()
 	if _, err := s2.ReadAudio(); err != nil {

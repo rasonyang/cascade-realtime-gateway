@@ -16,16 +16,20 @@ import (
 )
 
 // LLMOptions is the "options" block of providers.llm for type "openai".
-// ReasoningEffort is passed through verbatim when set ("none", "minimal",
-// "low", …); supported values differ per model and non-reasoning models
-// reject the field, so it has no default.
+// ReasoningEffort is passed through verbatim when set ("none", "low",
+// "medium", …); supported values differ per model and non-reasoning models
+// reject the field, so it is omitted unless set, with one exception: the
+// default model (gpt-6-luna) rejects function tools on Chat Completions
+// unless reasoning_effort is "none", so for it an empty value means "none".
+// Any other reasoning model the operator picks must set "none" explicitly to
+// be used with tools.
 type LLMOptions struct {
 	httpOptions
 	Model           string `json:"model"`
 	ReasoningEffort string `json:"reasoning_effort"`
 }
 
-const defaultChatModel = "gpt-4o-mini"
+const defaultChatModel = "gpt-6-luna"
 
 // chunkQueue bounds chunks buffered between the SSE reader and the consumer.
 const chunkQueue = 16
@@ -54,6 +58,9 @@ func NewLLM(apiKey string, o LLMOptions) *LLM {
 	o.applyDefaults()
 	if o.Model == "" {
 		o.Model = defaultChatModel
+	}
+	if o.Model == defaultChatModel && o.ReasoningEffort == "" {
+		o.ReasoningEffort = "none"
 	}
 	return &LLM{apiKey: apiKey, opts: o, client: newClient(o.httpOptions)}
 }

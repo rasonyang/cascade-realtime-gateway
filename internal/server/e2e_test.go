@@ -4,11 +4,10 @@ package server
 
 import (
 	"context"
+	_ "embed"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -27,9 +26,9 @@ import (
 	"github.com/rasonyang/cascade-realtime-gateway/internal/config"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/observability"
 	"github.com/rasonyang/cascade-realtime-gateway/internal/provider"
-	"github.com/rasonyang/cascade-realtime-gateway/internal/provider/openai"
 
 	_ "github.com/rasonyang/cascade-realtime-gateway/internal/provider/deepgram"
+	_ "github.com/rasonyang/cascade-realtime-gateway/internal/provider/openai"
 )
 
 // logCapture records slog records with timestamps so provider lifecycle
@@ -117,29 +116,19 @@ func checkClosed(t *testing.T, capture *logCapture, name, msg string, cancelAt t
 	}
 }
 
-// synthesize turns text into 24 kHz PCM with the real OpenAI TTS so the
-// input side of the pipeline gets genuine speech.
-func synthesize(t *testing.T, key, text string) []byte {
-	t.Helper()
-	tts := openai.NewTTS(key, openai.TTSOptions{})
-	s, err := tts.Synthesize(context.Background(), provider.TTSConfig{Voice: "alloy", Speed: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.WriteText(text)
-	s.EndInput()
-	var pcm []byte
-	for {
-		c, err := s.ReadAudio()
-		if errors.Is(err, io.EOF) {
-			return pcm
-		}
-		if err != nil {
-			t.Fatalf("synthesize: %v", err)
-		}
-		pcm = append(pcm, c.PCM...)
-	}
-}
+// The input speech is committed audio, not synthesized per run: a TTS model
+// is stochastic (the Realtime one pads, repeats and drops words), and the
+// REST models that sounded clean are retired on 2027-01-06. Each file is 24 kHz
+// mono 16-bit PCM from OpenAI tts-1 (voice alloy) of the sentence in its
+// name, checked by a Deepgram round trip.
+var (
+	//go:embed testdata/e2e_hello.pcm
+	speechHello []byte // "Hello, can you hear me, yes or no?"
+	//go:embed testdata/e2e_ocean.pcm
+	speechOcean []byte // "Describe the ocean in exactly three short sentences."
+	//go:embed testdata/e2e_story.pcm
+	speechStory []byte // "Please tell me a long story about the ocean, with at least ten sentences."
+)
 
 func TestE2EVoiceTurnAndInterrupt(t *testing.T) {
 	dgKey, oaKey := os.Getenv("DEEPGRAM_API_KEY"), os.Getenv("OPENAI_API_KEY")
@@ -159,12 +148,12 @@ func TestE2EVoiceTurnAndInterrupt(t *testing.T) {
 	}
 	llmModel := os.Getenv("CASCADE_E2E_LLM_MODEL")
 	if llmModel == "" {
-		llmModel = "gpt-4o-mini"
+		llmModel = "gpt-6-luna"
 	}
 	t.Logf("llm model: %s (override with CASCADE_E2E_LLM_MODEL)", llmModel)
 	ttsModel := os.Getenv("CASCADE_E2E_TTS_MODEL")
 	if ttsModel == "" {
-		ttsModel = "tts-1"
+		ttsModel = "gpt-realtime-2.1-mini"
 	}
 	prof := config.DefaultProfile()
 	prof.Name, prof.ASR, prof.LLM, prof.TTS = "e2e", "deepgram-asr", "openai-llm", "openai-tts"
@@ -206,7 +195,7 @@ func TestE2EVoiceTurnAndInterrupt(t *testing.T) {
 	c.timeout = 30 * time.Second // real providers: reasoning models can stall for seconds
 	c.readUntil("conversation.created")
 
-	hello := synthesize(t, oaKey, "Hello, can you hear me, yes or no?")
+	hello := speechHello
 	t.Logf("input speech: %d ms", audio.BytesToMs(len(hello)))
 
 	type stamp struct {
@@ -287,7 +276,7 @@ turn1done:
 
 	// ---- Profile turn: a three-sentence answer, streamed end to end ----------
 	{
-		ask := synthesize(t, oaKey, "Describe the ocean in exactly three short sentences.")
+		ask := speechOcean
 		sendAudio(silence(300))
 		sendAudio(ask)
 		sendAudio(silence(1500))
@@ -343,7 +332,7 @@ turn1done:
 	// already be done); turn 3 cancels at the first transcript delta (the
 	// LLM is certainly streaming, TTS may not have started).
 	for turn, cancelOn := range map[int]string{2: "response.output_audio.delta", 3: "response.output_audio_transcript.delta"} {
-		story := synthesize(t, oaKey, "Please tell me a long story about the ocean, with at least ten sentences.")
+		story := speechStory
 		sendAudio(silence(300))
 		sendAudio(story)
 		sendAudio(silence(1500))
