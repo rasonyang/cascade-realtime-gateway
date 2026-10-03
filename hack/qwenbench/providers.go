@@ -190,7 +190,7 @@ func benchASR(ctx context.Context, key string, pcm []byte, samples int, cap *log
 		}
 		progress("asr", i+1, samples)
 	}
-	return summarizeAll("ASR — qwen-audio-3.0-asr-flash-streaming",
+	return summarizeAll("ASR — qwen-audio-3.1-asr-flash-streaming",
 		"One turn per sample on one warm connection. \"first result\" is the first partial transcript;\n"+
 			"\"final\" is measured from the last audio frame pushed, with Finalize issued immediately after.",
 		coldDial, warmDial, started, firstResult, final, endOfTurn), nil
@@ -386,7 +386,7 @@ func benchTTS(ctx context.Context, key string, opts qwen.TTSOptions, samples int
 		incremental.add(toAudioInc)
 		progress("tts", i, samples)
 	}
-	return summarizeAll("TTS — qwen-audio-3.0-tts-flash",
+	return summarizeAll("TTS — qwen-audio-3.1-tts-flash",
 		fmt.Sprintf("One stream per sample. \"100ms audio\" is the point at which %d ms of PCM has arrived,\n"+
 			"the smallest buffer a client can start playing without an immediate underrun.\n"+
 			"\"incremental\" holds the task open for 300 ms after the first sentence, as the pipeline does\n"+

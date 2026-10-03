@@ -37,7 +37,7 @@ type ASROptions struct {
 }
 
 const (
-	defaultASRModel         = "qwen-audio-3.0-asr-flash-streaming"
+	defaultASRModel         = "qwen-audio-3.1-asr-flash-streaming"
 	defaultFinalizeTimeout  = 3 * time.Second
 	defaultAudioQueueFrames = 500 // 10 s of 20 ms frames
 	asrEventQueue           = 32
@@ -45,9 +45,11 @@ const (
 
 	// dashScopeNoAudioLimit is how long the service lets a recognition task
 	// run without an audio frame. When it expires the service ends the task
-	// itself, which with no audio fails as "SERVER_ERROR: DecodePost resample
-	// audio from 24000 to 16000 failed" and closes the socket with 1011.
-	// Measured on the live endpoint; not documented.
+	// itself and closes the socket. The 3.0 model reports it as "SERVER_ERROR:
+	// DecodePost resample audio from 24000 to 16000 failed" (close 1011), the
+	// 3.1 model as CLIENT_ERROR "request timeout after 23 seconds." (close
+	// 1007); the limit is the same. Measured on the live endpoint; not
+	// documented.
 	dashScopeNoAudioLimit    = 23 * time.Second
 	defaultKeepAliveInterval = 10 * time.Second
 	// keepAliveMs is the length of one keep-alive silence frame. Recognition

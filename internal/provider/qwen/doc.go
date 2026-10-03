@@ -3,9 +3,9 @@
 //
 //   - LLM: the OpenAI-compatible streaming Chat Completions API under
 //     /compatible-mode/v1, with enable_thinking forced to false.
-//   - ASR: qwen-audio-3.0-asr-flash-streaming over the DashScope duplex
+//   - ASR: qwen-audio-3.1-asr-flash-streaming over the DashScope duplex
 //     WebSocket at /api-ws/v1/inference.
-//   - TTS: qwen-audio-3.0-tts-flash over the same WebSocket endpoint.
+//   - TTS: qwen-audio-3.1-tts-flash over the same WebSocket endpoint.
 //
 // Layering: qwen imports provider, config and audio only. Every DashScope
 // wire shape (the header/payload envelope, run-task / continue-task /

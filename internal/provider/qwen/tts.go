@@ -34,13 +34,15 @@ type TTSOptions struct {
 // more input arrives, so without it the first audio frame waits for the LLM's
 // next sentence: measured at 1.05 s with an 800 ms gap versus 0.25 s with the
 // nudge, for byte-identical spoken content (hack/qwenbench, docs/decisions.md).
+// Re-verified on qwen-audio-3.1-tts-flash: with an 800 ms gap first audio is
+// 1025 ms without the nudge and 222 ms with it, the same as on 3.0.
 const flushNudge = " "
 
 const (
-	defaultTTSModel = "qwen-audio-3.0-tts-flash"
+	defaultTTSModel = "qwen-audio-3.1-tts-flash"
 	// defaultVoice is a voice the flash model ships with; the session's
 	// audio.output.voice normally overrides it.
-	defaultVoice  = "longanlingxi"
+	defaultVoice  = "longanlingxi_v3.1"
 	ttsAudioQueue = 64
 	ttsTextQueue  = 32
 )
