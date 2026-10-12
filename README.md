@@ -180,10 +180,11 @@ interface and registering it.
 ### Latency
 
 Cascade itself adds under 1 ms between provider audio and client audio (p50); a turn's latency is the
-providers' plus the VAD silence window. Measured on the Qwen stack over 20 turns: end of user speech
-→ first playable audio p50 1223 ms, p95 1854 ms, of which 391 ms is the VAD hold. Those figures come
-from a dedicated Model Studio deployment; the public endpoint has not been measured. Method and the
-per-stage budget are in [`docs/qwen-latency.md`](docs/qwen-latency.md).
+providers' plus the VAD silence window. Measured on the Qwen package defaults against the public
+endpoint over 20 turns (2026-10-03): end of user speech → first playable audio p50 1063 ms, p95
+1283 ms, of which 274 ms is the VAD hold. An earlier run on a dedicated Model Studio deployment with
+the 3.0 models measured p50 1223 ms, p95 1854 ms. Method and the per-stage budget are in
+[`docs/qwen-latency.md`](docs/qwen-latency.md).
 
 ## Configuration
 
